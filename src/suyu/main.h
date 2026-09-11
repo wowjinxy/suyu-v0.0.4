@@ -620,10 +620,13 @@ private:
     std::unique_ptr<FileSys::ManualContentProvider> provider;
 
     // Debugger panes
-    ProfilerWidget* profilerWidget;
-    MicroProfileDialog* microProfileDialog;
-    WaitTreeWidget* waitTreeWidget;
-    ControllerDialog* controller_dialog;
+    ProfilerWidget* profilerWidget{};
+    // Only assigned under #if MICROPROFILE_ENABLED, which is off on Linux. Without
+    // the initializer the null guards in ApplyAppMode test uninitialized memory and
+    // the setVisible call through the garbage pointer segfaults at startup.
+    MicroProfileDialog* microProfileDialog{};
+    WaitTreeWidget* waitTreeWidget{};
+    ControllerDialog* controller_dialog{};
 
     // Feature widgets
     ProgrammerEnvironment* programmer_env_{};
