@@ -19,9 +19,11 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -641,6 +643,58 @@ RelocationPlanSummary SummarizeRelocationPlan(const suyu::recomp::NsoRelocationP
     return summary;
 }
 
+std::optional<std::vector<u64>> CollectDynamicExportRoots(
+    const suyu::recomp::DecodedNso& image, std::string& error) {
+    // A tiny synthetic or fully static module can legitimately omit both
+    // tables. Once either NSO extent is present, however, require the complete
+    // bounded ELF metadata rather than silently emitting an incomplete block
+    // map from malformed symbol information.
+    if (image.info.dynsym.size == 0 && image.info.dynstr.size == 0) {
+        return std::vector<u64>{};
+    }
+
+    const auto dynamic = suyu::recomp::ParseNsoDynamic(image);
+    if (!dynamic) {
+        error = "could not parse ELF64 dynamic metadata for block roots: " + dynamic.error;
+        return std::nullopt;
+    }
+    const auto symbols = suyu::recomp::ParseNsoDynamicSymbols(image, *dynamic.info);
+    if (!symbols) {
+        error = "could not parse dynamic symbols for block roots: " + symbols.error;
+        return std::nullopt;
+    }
+
+    const u64 text_address = image.info.segments[0].memory_offset;
+    const u64 text_size = image.segments[0].size();
+    std::vector<u64> roots;
+    try {
+        roots.reserve(symbols.info->symbols.size());
+        for (const suyu::recomp::NsoDynamicSymbol& symbol : symbols.info->symbols) {
+            if (!symbol.IsExternallyVisibleDefinition() || (symbol.value & 3) != 0 ||
+                symbol.value < text_address) {
+                continue;
+            }
+            const u64 offset = symbol.value - text_address;
+            if (offset <= text_size && 4 <= text_size - offset) {
+                // Do not restrict this to STT_FUNC. Some retail SDKs publish
+                // callable entry points with STT_NOTYPE; being externally
+                // visible and instruction-aligned inside executable text is
+                // the property the cross-module dispatcher actually needs.
+                roots.push_back(symbol.value);
+            }
+        }
+        std::sort(roots.begin(), roots.end());
+        roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+    } catch (const std::bad_alloc&) {
+        error = "could not allocate dynamic-symbol block roots";
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        error = "dynamic-symbol block roots are unsupported on this host";
+        return std::nullopt;
+    }
+    return roots;
+}
+
 std::optional<LoadedNpdm> LoadNpdm(const std::filesystem::path& path) {
     const auto bytes = ReadFile(path, "main.npdm", suyu::recomp::MaximumNpdmSize);
     if (!bytes) {
@@ -842,8 +896,16 @@ int InspectNso(const Options& options) {
                         "could not validate the conventional AArch64 entry stub and MOD0 header";
                 } else {
                     aarch64_entry = base + entry_offset;
-                    aarch64_blocks = suyu::recomp::DiscoverBlocks(text.data(), text.size(), base,
-                                                                  *aarch64_entry, nullptr);
+                    std::string dynamic_roots_error;
+                    const auto dynamic_roots =
+                        CollectDynamicExportRoots(*decoded.image, dynamic_roots_error);
+                    if (!dynamic_roots) {
+                        aarch64_error = std::move(dynamic_roots_error);
+                    } else {
+                        aarch64_blocks = suyu::recomp::DiscoverBlocks(
+                            text.data(), text.size(), base, *aarch64_entry,
+                            dynamic_roots->empty() ? nullptr : &*dynamic_roots);
+                    }
                 }
             }
         }
@@ -1227,6 +1289,12 @@ int EmitNso(const Options& options) {
         return 1;
     }
     const u64 entry = base + entry_offset;
+    std::string dynamic_roots_error;
+    const auto dynamic_roots = CollectDynamicExportRoots(*decoded.image, dynamic_roots_error);
+    if (!dynamic_roots) {
+        std::cerr << "error: " << dynamic_roots_error << '\n';
+        return 1;
+    }
     std::string identity_error;
     const auto mapped_text_identity = ComputeMappedTextIdentity(text, identity_error);
     if (!mapped_text_identity) {
@@ -1241,7 +1309,8 @@ int EmitNso(const Options& options) {
         const auto stats = suyu::recomp::EmitProject(
             options.module, text.data(), text.size(), base, PathToUtf8(options.output_path), true,
             rodata.empty() ? nullptr : rodata.data(), rodata.size(),
-            data.empty() ? nullptr : data.data(), data.size(), entry, options.title, nullptr,
+            data.empty() ? nullptr : data.data(), data.size(), entry, options.title,
+            dynamic_roots->empty() ? nullptr : &*dynamic_roots,
             suyu::recomp::RecompileImageLayout{info.segments[1].memory_offset,
                                                info.segments[2].memory_offset, info.bss_size},
             &info.build_id, &mapped_text_identity->sha256,
@@ -1253,7 +1322,8 @@ int EmitNso(const Options& options) {
         std::cout << "NSO build ID: " << suyu::recomp::NsoBuildIdToHex(info.build_id) << '\n'
                   << "Architecture: AArch64 (" << (npdm ? "main.npdm" : "explicit assumption")
                   << ")\n"
-                  << "Entry: " << Hex(entry) << '\n';
+                  << "Entry: " << Hex(entry) << '\n'
+                  << "Dynamic export roots: " << dynamic_roots->size() << '\n';
         for (const std::string& warning : decoded.warnings) {
             std::cerr << "warning: " << warning << '\n';
         }

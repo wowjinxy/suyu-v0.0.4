@@ -25,6 +25,13 @@ void CheckNoShiftBy64(std::uint32_t instruction, std::string_view description) {
           "bitfield translation never emits a 64-bit C shift count");
 }
 
+void CheckPrefetchNoop(std::uint32_t instruction, std::string_view description) {
+    std::string output;
+    Check(suyu::recomp::Translate(instruction, 0x1000, output), description);
+    Check(output == "    /* prfum */\n",
+          "PRFUM emits a no-op without unused address temporaries");
+}
+
 } // namespace
 
 int main() {
@@ -34,6 +41,11 @@ int main() {
 
     // SBFM X0, X1, #0, #63 is a full-width move and likewise needs no extension mask.
     CheckNoShiftBy64(0x9340FC20, "full-width SBFM translates");
+
+    // Real SDK instances with positive and negative unscaled offsets. PRFUM is a cache hint,
+    // so declaring address temporaries for it only creates compiler warnings in generated C.
+    CheckPrefetchNoop(0xF8801120, "positive-offset PRFUM translates");
+    CheckPrefetchNoop(0xF89C0100, "negative-offset PRFUM translates");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

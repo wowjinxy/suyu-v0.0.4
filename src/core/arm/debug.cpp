@@ -91,7 +91,7 @@ void SymbolicateBacktrace(Kernel::KProcess* process, std::vector<BacktraceEntry>
 
     std::map<std::string, Symbols::Symbols> symbols;
     for (const auto& module : modules) {
-        symbols.insert_or_assign(module.second,
+        symbols.insert_or_assign(module.second.name,
                                  Symbols::GetSymbols(module.first, process->GetMemory(), is_64));
     }
 
@@ -100,7 +100,7 @@ void SymbolicateBacktrace(Kernel::KProcess* process, std::vector<BacktraceEntry>
         for (auto iter = modules.rbegin(); iter != modules.rend(); ++iter) {
             const auto& module{*iter};
             if (entry.original_address >= module.first) {
-                entry.module = module.second;
+                entry.module = module.second.name;
                 base = module.first;
                 break;
             }
@@ -380,8 +380,10 @@ Loader::AppLoader::Modules FindModules(Kernel::KProcess* process) {
                     }
 
                     // Insert output.
-                    modules.emplace(svc_mem_info.base_address,
-                                    std::string_view(path_pointer, path_end));
+                    modules.emplace(
+                        svc_mem_info.base_address,
+                        Loader::AppLoader::NsoModuleInfo{
+                            std::string{std::string_view(path_pointer, path_end)}, {}});
                 }
             }
         }

@@ -22,6 +22,14 @@ std::uint32_t ReadU32(std::span<const std::uint8_t> bytes, std::size_t offset) {
            (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
 }
 
+std::uint64_t ReadU64(std::span<const std::uint8_t> bytes, std::size_t offset) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < sizeof(value); ++i) {
+        value |= static_cast<std::uint64_t>(bytes[offset + i]) << (i * 8);
+    }
+    return value;
+}
+
 bool RangeFits(std::uint64_t offset, std::uint64_t size, std::uint64_t limit) {
     return offset <= limit && size <= limit - offset;
 }
@@ -89,20 +97,99 @@ std::uint32_t FindNsoAarch64EntryOffsetImpl(
     }
 
     const std::uint32_t instruction = ReadU32(text, 0);
-    if ((instruction & 0xFC000000) != 0x14000000) { // B imm26
+    if ((instruction & 0xFC000000) == 0x14000000) { // B imm26
+        const std::int32_t immediate = static_cast<std::int32_t>(instruction << 6) >> 6;
+        const std::int64_t target = static_cast<std::int64_t>(immediate) * 4;
+        if (target < 8 || !RangeFits(static_cast<std::uint64_t>(target), 4, text.size())) {
+            return 0;
+        }
+        if (mod0_segment == static_cast<std::size_t>(NsoSegmentId::Text) &&
+            RangesOverlap(static_cast<std::uint64_t>(target), 4, mod0_local_offset,
+                          MinimumMod0HeaderSize)) {
+            return 0;
+        }
+        return static_cast<std::uint32_t>(target);
+    }
+
+    // Only the first loaded NSO is the process entry point. NintendoSDK leaves
+    // word zero reserved in later modules (normally `main`, `subsdk*`, and
+    // `sdk`) and records their initializer in ELF64 DT_INIT instead. Requiring
+    // every module to begin with a branch therefore rejects ordinary retail
+    // multi-NSO applications. Do not guess past arbitrary non-branch words:
+    // accept precisely the reserved-zero form and validate its bounded,
+    // terminated dynamic table before trusting DT_INIT.
+    if (instruction != 0) {
         return 0;
     }
-    const std::int32_t immediate = static_cast<std::int32_t>(instruction << 6) >> 6;
-    const std::int64_t target = static_cast<std::int64_t>(immediate) * 4;
-    if (target < 8 || !RangeFits(static_cast<std::uint64_t>(target), 4, text.size())) {
+
+    constexpr std::uint64_t Elf64DynamicEntrySize = 0x10;
+    constexpr std::uint64_t MaximumDynamicEntries = 4096;
+    constexpr std::uint64_t DtNull = 0;
+    constexpr std::uint64_t DtInit = 12;
+
+    const auto read_module_u64 = [&](std::uint64_t address, std::size_t field_offset,
+                                     std::uint64_t& value) {
+        for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+            if (address < memory_offsets[i]) {
+                continue;
+            }
+            const std::uint64_t local_offset = address - memory_offsets[i];
+            if (RangeFits(local_offset, Elf64DynamicEntrySize, segments[i].size())) {
+                value = ReadU64(segments[i], static_cast<std::size_t>(local_offset) + field_offset);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const std::uint32_t dynamic_offset =
+        ReadU32(segments[mod0_segment], static_cast<std::size_t>(mod0_local_offset) + 4);
+    if (dynamic_offset < MinimumMod0HeaderSize ||
+        dynamic_offset > std::numeric_limits<std::uint64_t>::max() - mod0_address) {
         return 0;
     }
-    if (mod0_segment == static_cast<std::size_t>(NsoSegmentId::Text) &&
-        RangesOverlap(static_cast<std::uint64_t>(target), 4, mod0_local_offset,
-                      MinimumMod0HeaderSize)) {
+    const std::uint64_t dynamic_address = mod0_address + dynamic_offset;
+    if ((dynamic_address & 7) != 0) {
         return 0;
     }
-    return static_cast<std::uint32_t>(target);
+
+    std::uint64_t init_address = 0;
+    bool found_init = false;
+    for (std::uint64_t index = 0; index < MaximumDynamicEntries; ++index) {
+        if (index > (std::numeric_limits<std::uint64_t>::max() - dynamic_address) /
+                        Elf64DynamicEntrySize) {
+            return 0;
+        }
+        const std::uint64_t entry_address = dynamic_address + index * Elf64DynamicEntrySize;
+        std::uint64_t tag = 0;
+        std::uint64_t value = 0;
+        if (!read_module_u64(entry_address, 0, tag) ||
+            !read_module_u64(entry_address, sizeof(std::uint64_t), value)) {
+            return 0;
+        }
+        if (tag == DtNull) {
+            if (!found_init || init_address < memory_offsets[0]) {
+                return 0;
+            }
+            const std::uint64_t target = init_address - memory_offsets[0];
+            if ((target & 3) != 0 || !RangeFits(target, 4, text.size())) {
+                return 0;
+            }
+            if (mod0_segment == static_cast<std::size_t>(NsoSegmentId::Text) &&
+                RangesOverlap(target, 4, mod0_local_offset, MinimumMod0HeaderSize)) {
+                return 0;
+            }
+            return static_cast<std::uint32_t>(target);
+        }
+        if (tag == DtInit) {
+            if (found_init && init_address != value) {
+                return 0;
+            }
+            init_address = value;
+            found_init = true;
+        }
+    }
+    return 0;
 }
 
 } // namespace

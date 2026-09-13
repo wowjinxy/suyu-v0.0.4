@@ -313,8 +313,21 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         }
 
         next_load_addr = *tentative_next_load_addr;
-        modules.insert_or_assign(load_addr, module);
+        modules.insert_or_assign(
+            load_addr,
+            AppLoader::NsoModuleInfo{module, system.GetApplicationProcessBuildID()});
         LOG_DEBUG(Loader, "loaded module {} @ {:#X}", module, load_addr);
+    }
+
+    // LoadModule records each NSO's build ID while loading it. Preserve the
+    // application's main identity in the legacy system-wide slot instead of
+    // leaving it set to whichever library happened to load last.
+    for (const auto& entry : modules) {
+        const auto& module = entry.second;
+        if (module.name == "main") {
+            system.SetApplicationProcessBuildID(module.build_id);
+            break;
+        }
     }
 
     // AppLoader_NCA/NSP/NRO all register a RomFSFactory for their process here;

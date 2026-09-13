@@ -117,7 +117,8 @@ if(NOT DYNAMIC_INSPECT_RESULT EQUAL 0)
 endif()
 foreach(EXPECTED
         "AArch64 entry: 0x1010"
-        "ELF64 dynamic: MOD0=0x6000 table=0x6020 non-null-entries=10 bytes=176"
+        "AArch64 blocks: 4"
+        "ELF64 dynamic: MOD0=0x6000 table=0x6020 non-null-entries=11 bytes=192"
         "Dynamic symbols: address=0x6180 entry-size=24"
         "Dynamic RELA: address=0x6100 bytes=24 entries=1 entry-size=24"
         "PLT RELA: address=0x6118 bytes=24 entries=1 entry-size=24"

@@ -110,9 +110,10 @@ NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file,
                           std::uint64_t max_decoded_bytes = DefaultNsoDecodeLimit,
                           NsoSha256Hasher sha256_hasher = nullptr);
 
-/// Returns the target of the conventional AArch64 `b` entry stub when text+4 points to a valid
-/// MOD0 header, or zero when that layout cannot be identified. Calling this is an explicit
-/// architecture assumption; NSO0 itself has no ISA field.
+/// Returns the target of the conventional AArch64 `b` process-entry stub when text+4 points to a
+/// valid MOD0 header. For a later NintendoSDK module whose reserved first word is zero, returns its
+/// validated ELF64 DT_INIT target instead. Returns zero when neither layout can be identified.
+/// Calling this is an explicit architecture assumption; NSO0 itself has no ISA field.
 std::uint32_t FindNsoAarch64EntryOffset(std::span<const std::uint8_t> text);
 
 /// As above, but resolves the module-relative MOD0 pointer across every decoded NSO segment.

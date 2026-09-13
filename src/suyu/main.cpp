@@ -6208,8 +6208,16 @@ namespace {
         Core::RecompTextSizeFn text_size;
         u64 base = 0;
     };
+struct PendingRecompImageBinding {
+    RecompImage* image{};
+    u64 base{};
+    std::size_t index{};
+    std::string module_name;
+};
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
+std::vector<PendingRecompImageBinding> pending_image_bindings;
+std::size_t pending_image_binding_count{};
 } // Anonymous namespace
 
 void GMainWindow::UnloadRecompiledImages() {
@@ -6221,6 +6229,8 @@ void GMainWindow::UnloadRecompiledImages() {
     }
     loaded_images.clear();
     loaded_records.clear();
+    pending_image_bindings.clear();
+    pending_image_binding_count = 0;
 }
 
 bool GMainWindow::RecompiledImagesLoaded() const {
@@ -6339,16 +6349,42 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     }
     loaded_images = std::move(found);
     loaded_records = std::move(records);
+    pending_image_bindings.clear();
+    pending_image_binding_count = 0;
 
-    Core::SetRecompBinder([](size_t index, const char* module, u64 base, const u8* build_id,
-                             size_t build_id_size, const u8* text_sha256,
-                             size_t text_sha256_size, u64 text_size) -> bool {
+    Core::SetRecompBinder([](size_t index, size_t count, const char* module, u64 base,
+                             const u8* build_id, size_t build_id_size,
+                             const u8* text_sha256, size_t text_sha256_size,
+                             u64 text_size) -> bool {
         const char* module_name = module != nullptr ? module : "?";
+        if (index == 0) {
+            pending_image_bindings.clear();
+            pending_image_binding_count = 0;
+            for (auto& record : loaded_records) {
+                record.base = 0;
+                record.set_base(0);
+            }
+        }
+        const auto reject_batch = [] {
+            pending_image_bindings.clear();
+            pending_image_binding_count = 0;
+            return false;
+        };
+        if (count == 0 || index >= count || index != pending_image_bindings.size() ||
+            (index != 0 && count != pending_image_binding_count) || base == 0) {
+            LOG_ERROR(Frontend,
+                      "Invalid recompiled image batch at index {} (batch {}, available {})",
+                      index, count, loaded_records.size());
+            return reject_batch();
+        }
+        if (index == 0) {
+            pending_image_binding_count = count;
+        }
         if (build_id == nullptr || build_id_size != Core::RecompBuildIdSize ||
             text_sha256 == nullptr || text_sha256_size != Core::RecompSha256Size) {
             LOG_ERROR(Frontend, "Invalid identity while binding recompiled module '{}' (#{})",
                       module_name, index);
-            return false;
+            return reject_batch();
         }
 
         RecompImage* matched = nullptr;
@@ -6366,21 +6402,48 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
                 LOG_ERROR(Frontend,
                           "Multiple recompiled images match module '{}' (#{}) identity",
                           module_name, index);
-                return false;
+                return reject_batch();
             }
             matched = &record;
         }
         if (matched == nullptr) {
+            if (count == 1) {
+                LOG_WARNING(
+                    Frontend,
+                    "No recompiled image matches single module '{}' (text {:#x}, base {:#x})",
+                    module_name, text_size, base);
+                return reject_batch();
+            }
             LOG_WARNING(Frontend,
-                        "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x})",
+                        "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x}); "
+                        "using JIT fallback for this NSO",
                         module_name, index, text_size, base);
-            return false;
+        } else if (std::any_of(pending_image_bindings.begin(), pending_image_bindings.end(),
+                               [matched](const PendingRecompImageBinding& pending) {
+                                   return pending.image == matched;
+                               })) {
+            LOG_ERROR(Frontend,
+                      "Recompiled image matched more than one loaded NSO in the same batch");
+            return reject_batch();
         }
 
-        matched->base = base;
-        matched->set_base(base);
-        LOG_INFO(Frontend, "Build-ID matched recompiled image '{}' for module '{}' (#{}) at {:#x}",
-                 matched->name, module_name, index, base);
+        pending_image_bindings.push_back(
+            PendingRecompImageBinding{matched, base, index, module_name});
+        if (pending_image_bindings.size() != count) {
+            return true;
+        }
+        for (const PendingRecompImageBinding& pending : pending_image_bindings) {
+            if (pending.image == nullptr) {
+                continue;
+            }
+            pending.image->base = pending.base;
+            pending.image->set_base(pending.base);
+            LOG_INFO(Frontend,
+                     "Build-ID matched recompiled image '{}' for module '{}' (#{}) at {:#x}",
+                     pending.image->name, pending.module_name, pending.index, pending.base);
+        }
+        pending_image_bindings.clear();
+        pending_image_binding_count = 0;
         return true;
     });
 

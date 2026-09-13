@@ -51,19 +51,25 @@ using RecompTextSizeFn = u64 (*)();
  */
 void SetRecompLookup(RecompLookupFn lookup);
 
-/// Identifies the loaded NSO by its immutable 32-byte build ID, then tells the
-/// matching recompiled image where the module landed. The callback must return
-/// true only after finding exactly one byte-for-byte build-ID, mapped-text-size,
-/// and live-text SHA-256 match and setting that image's base. Initialization
-/// fails closed before guest memory is modified when no matching image exists.
+/// Identifies each loaded NSO by its immutable 32-byte build ID, mapped-text
+/// size, and live-text SHA-256. A true return stages either one unique matching
+/// image or, where allowed below, an explicit JIT-fallback entry. Matching image
+/// bases are published only when the complete batch has been accepted; a
+/// rejected batch fails closed before guest memory is modified.
 ///
-/// `index` and `module` are diagnostic hints only. They are not identities:
+/// `index`, `count`, and `module` describe one ordered batch. A binder must not
+/// publish any matched module bases until all `count` loaded identities have
+/// been examined, so a rejected batch cannot expose a partially bound image
+/// set. In a multi-NSO batch, a loaded NSO with no available recompiled image
+/// may be accepted as an explicit JIT-fallback entry; a single-NSO batch must
+/// match, and matched images must remain unique within the batch.
+/// `index` and `module` are otherwise diagnostic hints, not identities:
 /// filenames and embedded module names routinely differ, while load order is
 /// not sufficient to distinguish two unrelated single-module titles.
-using RecompBindFn = bool (*)(std::size_t index, const char* module, u64 base,
-                              const u8* build_id, std::size_t build_id_size,
-                              const u8* text_sha256, std::size_t text_sha256_size,
-                              u64 text_size);
+using RecompBindFn = bool (*)(std::size_t index, std::size_t count, const char* module, u64 base,
+                               const u8* build_id, std::size_t build_id_size,
+                               const u8* text_sha256, std::size_t text_sha256_size,
+                               u64 text_size);
 void SetRecompBinder(RecompBindFn binder);
 
 /// Returns the registered lookup, or nullptr when no recompiled image is

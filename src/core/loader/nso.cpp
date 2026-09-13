@@ -238,7 +238,9 @@ AppLoader_NSO::LoadResult AppLoader_NSO::Load(Kernel::KProcess& process, Core::S
         return {ResultStatus::ErrorLoadingNSO, {}};
     }
 
-    modules.insert_or_assign(base_address, file->GetName());
+    modules.insert_or_assign(
+        base_address,
+        AppLoader::NsoModuleInfo{file->GetName(), system.GetApplicationProcessBuildID()});
     LOG_DEBUG(Loader, "loaded module {} @ {:#X}", file->GetName(), base_address);
 
     is_loaded = true;

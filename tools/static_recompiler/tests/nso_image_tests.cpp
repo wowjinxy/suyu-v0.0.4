@@ -177,9 +177,13 @@ std::vector<Byte> MakeDynamicNso() {
         bytes[0x40 + i] = static_cast<Byte>(0x40 + i);
     }
 
-    PutU32(bytes, TextFile, 0x14000004); // b text+0x10
+    // A normal non-entry NintendoSDK module: word zero is reserved, MOD0 is
+    // still located through text+4, and its module initializer comes from
+    // ELF64 DT_INIT rather than a process-entry branch.
+    PutU32(bytes, TextFile, 0);
     PutU32(bytes, TextFile + 4, RoDataAddress - TextAddress);
-    PutU32(bytes, TextFile + 0x10, 0xD65F03C0); // ret
+    PutU32(bytes, TextFile + 0x10, 0xD503201F); // nop (DT_INIT)
+    PutU32(bytes, TextFile + 0x14, 0xD65F03C0); // ret (exported function)
 
     const auto ro_file_offset = [](std::uint32_t address) {
         return static_cast<std::size_t>(RoDataFile + address - RoDataAddress);
@@ -207,7 +211,8 @@ std::vector<Byte> MakeDynamicNso() {
     put_dynamic(7, 11, 24);                    // DT_SYMENT
     put_dynamic(8, 5, StringTableAddress);     // DT_STRTAB
     put_dynamic(9, 10, DynamicStrings.size()); // DT_STRSZ
-    put_dynamic(10, 0, 0);                     // DT_NULL
+    put_dynamic(10, 12, TextAddress + 0x10);   // DT_INIT
+    put_dynamic(11, 0, 0);                     // DT_NULL
 
     const auto put_rela = [&](std::uint32_t address, std::uint64_t target, std::uint32_t symbol,
                               std::uint32_t type, std::int64_t addend) {
@@ -226,7 +231,7 @@ std::vector<Byte> MakeDynamicNso() {
     PutU32(bytes, symbol_table + 48, 10);
     bytes[symbol_table + 48 + 4] = 0x12; // STB_GLOBAL | STT_FUNC
     PutU16(bytes, symbol_table + 48 + 6, 1);
-    PutU64(bytes, symbol_table + 48 + 8, TextAddress + 0x10);
+    PutU64(bytes, symbol_table + 48 + 8, TextAddress + 0x14);
     PutU64(bytes, symbol_table + 48 + 16, 4);
     PutU32(bytes, symbol_table + 72, 19);
     bytes[symbol_table + 72 + 4] = 0x11;          // STB_GLOBAL | STT_OBJECT
@@ -482,6 +487,22 @@ void RunTests() {
     PutU32(fake_mod0, 0, 0x14000002); // b text+8, into MOD0 metadata
     Check(suyu::recomp::FindNsoAarch64EntryOffset(fake_mod0) == 0,
           "entry probe rejects a branch into the MOD0 header");
+
+    const auto library_module = suyu::recomp::DecodeNso(MakeDynamicNso());
+    Check(library_module &&
+              suyu::recomp::FindNsoAarch64EntryOffset(*library_module.image) == 0x10,
+          "entry probe accepts a reserved-zero library module with bounded DT_INIT");
+    if (library_module) {
+        auto missing_init = *library_module.image;
+        PutU64(missing_init.segments[1], 0x20 + 10 * 16, 0); // DT_NULL replaces DT_INIT
+        Check(suyu::recomp::FindNsoAarch64EntryOffset(missing_init) == 0,
+              "reserved-zero module requires DT_INIT before DT_NULL");
+
+        auto invalid_init = *library_module.image;
+        PutU64(invalid_init.segments[1], 0x20 + 10 * 16 + 8, 0x1001);
+        Check(suyu::recomp::FindNsoAarch64EntryOffset(invalid_init) == 0,
+              "reserved-zero module rejects a misaligned DT_INIT target");
+    }
 
     suyu::recomp::DecodedNso split_mod0{};
     split_mod0.info.segments[0].memory_offset = 0x1000;

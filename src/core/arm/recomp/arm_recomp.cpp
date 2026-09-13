@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <openssl/evp.h>
 
@@ -340,16 +341,94 @@ struct ArmRecomp::Impl {
             return;
         }
         process_state->modules = modules;
-        if (modules.size() != 1) {
-            FailInitialization(
-                Initialization::FallbackOnly,
-                fmt::format("safe hosted relocation currently requires exactly one NSO module; "
-                            "the loader reported {}",
-                            modules.size()));
+        if (modules.empty()) {
+            FailInitialization(Initialization::FallbackOnly,
+                               "loader reported no NSO modules for the guest process");
             return;
         }
 
-        const auto& [module_base, module_name] = *modules.begin();
+        const auto binder = g_recomp_binder.load(std::memory_order_acquire);
+        if (binder == nullptr) {
+            FailInitialization(Initialization::FallbackOnly,
+                               "recompiled image has no identity-and-base binding callback");
+            return;
+        }
+
+        // A normal multi-NSO application starts in rtld. Its guest code owns
+        // cross-module symbol lookup and relocation, so the host must bind every
+        // generated image before the first instruction and then leave the
+        // relocation tables intact. The single-NSO path below remains host-
+        // relocated because there is no guest dynamic linker to do that work.
+        if (modules.size() > 1) {
+            if (modules.begin()->second.name != "rtld") {
+                FailInitialization(
+                    Initialization::FallbackOnly,
+                    "a multi-NSO recompiled process must begin with an rtld module");
+                return;
+            }
+
+            struct PendingBinding {
+                u64 base{};
+                const Loader::AppLoader::NsoModuleInfo* module{};
+                NsoModuleImageLayout layout{};
+                std::array<u8, RecompSha256Size> text_sha256{};
+            };
+            std::vector<PendingBinding> pending;
+            pending.reserve(modules.size());
+
+            auto& memory = process->GetMemory();
+            for (const auto& [module_base, module] : modules) {
+                const auto image_layout =
+                    GetNsoModuleImageLayout(process, Kernel::KProcessAddress{module_base});
+                if (!image_layout) {
+                    FailInitialization(
+                        Initialization::FallbackOnly,
+                        fmt::format("loaded NSO '{}' memory layout failed structural validation",
+                                    module.name));
+                    return;
+                }
+
+                PendingBinding binding{
+                    .base = module_base,
+                    .module = &module,
+                    .layout = *image_layout,
+                };
+                if (!HashMappedText(memory, module_base, image_layout->text_size,
+                                    binding.text_sha256)) {
+                    FailInitialization(
+                        Initialization::FallbackOnly,
+                        fmt::format("could not hash the live mapped text for NSO '{}'",
+                                    module.name));
+                    return;
+                }
+                pending.push_back(binding);
+            }
+
+            for (std::size_t index = 0; index < pending.size(); ++index) {
+                const PendingBinding& binding = pending[index];
+                const auto& module = *binding.module;
+                if (!binder(index, pending.size(), module.name.c_str(), binding.base,
+                            module.build_id.data(), module.build_id.size(),
+                            binding.text_sha256.data(), binding.text_sha256.size(),
+                            binding.layout.text_size)) {
+                    FailInitialization(
+                        Initialization::FallbackOnly,
+                        fmt::format("no unique recompiled image matched NSO '{}' identity and "
+                                    "live text",
+                                    module.name));
+                    return;
+                }
+            }
+
+            process_state->initialization = Initialization::Ready;
+            LOG_INFO(Core_ARM,
+                     "recomp: accepted {}-NSO hybrid batch; guest rtld will apply cross-module "
+                     "relocations",
+                     pending.size());
+            return;
+        }
+
+        const auto& [module_base, module_info] = *modules.begin();
         const auto image_layout =
             GetNsoModuleImageLayout(process, Kernel::KProcessAddress{module_base});
         if (!image_layout) {
@@ -404,12 +483,6 @@ struct ArmRecomp::Impl {
             return;
         }
 
-        const auto binder = g_recomp_binder.load(std::memory_order_acquire);
-        if (binder == nullptr) {
-            FailInitialization(Initialization::FallbackOnly,
-                               "recompiled image has no identity-and-base binding callback");
-            return;
-        }
         auto& memory = process->GetMemory();
         std::array<u8, RecompSha256Size> text_sha256{};
         if (!HashMappedText(memory, module_base, image_layout->text_size, text_sha256)) {
@@ -417,9 +490,9 @@ struct ArmRecomp::Impl {
                                "could not hash the live mapped NSO text image");
             return;
         }
-        const auto& build_id = system.GetApplicationProcessBuildID();
-        if (!binder(0, module_name.c_str(), module_base, build_id.data(), build_id.size(),
-                    text_sha256.data(), text_sha256.size(), image_layout->text_size)) {
+        if (!binder(0, 1, module_info.name.c_str(), module_base, module_info.build_id.data(),
+                    module_info.build_id.size(), text_sha256.data(), text_sha256.size(),
+                    image_layout->text_size)) {
             FailInitialization(
                 Initialization::FallbackOnly,
                 "no unique recompiled image matched the loaded NSO identity and live text");
@@ -448,7 +521,7 @@ struct ArmRecomp::Impl {
         LOG_INFO(Core_ARM,
                  "recomp: committed {} relocations and {} finalizers for '{}' at {:#x} "
                  "(image size {:#x})",
-                 committed.relocation_writes, committed.finalization_writes, module_name,
+                 committed.relocation_writes, committed.finalization_writes, module_info.name,
                  module_base, image_layout->image_size);
     }
 

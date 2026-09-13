@@ -694,6 +694,12 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         if (imm9 & 0x100) imm9 |= ~0x1FF;
         // mode 0 = LDUR/STUR, 1 = post-index, 3 = pre-index
         if ((mode == 0 || mode == 1 || mode == 3) && size <= 3) {
+            // PRFUM is only a cache hint. Emit its no-op directly so the
+            // generated C does not declare an otherwise-unused address.
+            if (size == 3 && opc >= 2) {
+                put("/* prfum */");
+                return true;
+            }
             const u32 bits = 8u << size;
             std::string s = "{ uint64_t _b=c->x[" + std::to_string(rn) + "]; int64_t _o=" +
                             std::to_string((long long)imm9) + "; ";
@@ -715,10 +721,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                     s += "c->x[" + std::to_string(rt) + "]=recomp_load" + std::to_string(bits) +
                          "(c," + addr + "); ";
                 }
-            } else if (size == 3) {
-                // opc>=2 with size==3 is PRFUM, a prefetch hint. It has no
-                // architectural effect, so emitting nothing is exact - what it
-                // must never do is store.
             } else if (rt != 31) {
                 s += "c->x[" + std::to_string(rt) + "]=(uint64_t)(int64_t)" + signed_cast +
                      "recomp_load" + std::to_string(bits) + "(c," + addr + "); ";

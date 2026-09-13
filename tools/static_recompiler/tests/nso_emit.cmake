@@ -14,6 +14,7 @@ file(REMOVE_RECURSE "${NSO_EMIT_TEST_DIR}")
 file(MAKE_DIRECTORY "${NSO_EMIT_TEST_DIR}")
 
 set(nso_fixture "${NSO_EMIT_TEST_DIR}/synthetic.nso")
+set(dynamic_nso_fixture "${NSO_EMIT_TEST_DIR}/synthetic-dynamic.nso")
 set(misaligned_nso_fixture "${NSO_EMIT_TEST_DIR}/misaligned.nso")
 set(reversed_nso_fixture "${NSO_EMIT_TEST_DIR}/reversed.nso")
 set(npdm_fixture "${NSO_EMIT_TEST_DIR}/main.npdm")
@@ -22,6 +23,7 @@ set(npdm_unknown_fixture "${NSO_EMIT_TEST_DIR}/main-unknown-address.npdm")
 set(npdm_oversized_fixture "${NSO_EMIT_TEST_DIR}/main-oversized.npdm")
 foreach(pair
         "--write-emittable-fixture;${nso_fixture}"
+        "--write-dynamic-fixture;${dynamic_nso_fixture}"
         "--write-misaligned-emittable-fixture;${misaligned_nso_fixture}"
         "--write-reversed-emittable-fixture;${reversed_nso_fixture}"
         "--write-npdm;${npdm_fixture}"
@@ -41,6 +43,34 @@ foreach(pair
             "Fixture writer failed (${fixture_result})\n${fixture_stdout}\n${fixture_stderr}")
     endif()
 endforeach()
+
+# Later NSOs in a retail process have a reserved zero at text+0 rather than a
+# process-entry branch. Their DT_INIT value is the module initializer, and
+# exported dynamic symbols must seed independent block starts for calls arriving
+# from rtld or another NSO.
+set(dynamic_generated_dir "${NSO_EMIT_TEST_DIR}/dynamic-generated")
+execute_process(
+    COMMAND "${RECOMP_TOOL}" emit-nso
+        --input "${dynamic_nso_fixture}"
+        --npdm "${npdm_fixture}"
+        --output "${dynamic_generated_dir}"
+    RESULT_VARIABLE dynamic_emit_result
+    OUTPUT_VARIABLE dynamic_emit_stdout
+    ERROR_VARIABLE dynamic_emit_stderr
+)
+if(NOT dynamic_emit_result EQUAL 0 OR
+   NOT dynamic_emit_stdout MATCHES "Entry: 0x1010" OR
+   NOT dynamic_emit_stdout MATCHES "Dynamic export roots: 1" OR
+   NOT dynamic_emit_stdout MATCHES "Generated 4 blocks from 8 AArch64 instructions")
+    message(FATAL_ERROR
+        "Reserved-zero/dynamic-root NSO emission failed:\n${dynamic_emit_stdout}${dynamic_emit_stderr}")
+endif()
+file(READ "${dynamic_generated_dir}/src/recompiled_main_0.c" dynamic_generated_code)
+string(FIND "${dynamic_generated_code}"
+       "{0x1014ULL, blk_main_0000000000001014}" dynamic_export_root_position)
+if(dynamic_export_root_position EQUAL -1)
+    message(FATAL_ERROR "Exported dynamic function was not emitted as an independent block root")
+endif()
 
 execute_process(
     COMMAND "${RECOMP_TOOL}" emit-nso

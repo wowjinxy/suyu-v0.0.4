@@ -400,6 +400,9 @@ int main(int argc, char** argv) {
         freopen("CONOUT$", "wb", stdout);
         freopen("CONOUT$", "wb", stderr);
     }
+    // Match the GUI frontend: large titles can keep well over the CRT's
+    // default 512 stdio streams open while loading RomFS assets.
+    _setmaxstdio(8192);
 #endif
 
     try {
@@ -639,7 +642,15 @@ int main(int argc, char** argv) {
         Core::RecompTextSizeFn text_size{};
         u64 base{};
     };
+    struct PendingRecompBinding {
+        RecompModule* module{};
+        u64 base{};
+        std::size_t index{};
+        std::string name;
+    };
     static std::vector<RecompModule> s_recomp_modules;
+    static std::vector<PendingRecompBinding> s_pending_recomp_bindings;
+    static std::size_t s_pending_recomp_count{};
 
     // Preferred path: modules compiled straight into this executable. Nothing
     // to find on disk, nothing to load, and no version skew between the exe and
@@ -728,15 +739,39 @@ int main(int argc, char** argv) {
             }
             return owner != nullptr ? owner->lookup(pc) : nullptr;
         });
-        Core::SetRecompBinder([](size_t index, const char* module, u64 base, const u8* build_id,
-                                 size_t build_id_size, const u8* text_sha256,
-                                 size_t text_sha256_size, u64 text_size) -> bool {
+        Core::SetRecompBinder([](size_t index, size_t count, const char* module, u64 base,
+                                 const u8* build_id, size_t build_id_size,
+                                 const u8* text_sha256, size_t text_sha256_size,
+                                 u64 text_size) -> bool {
             const char* module_name = module != nullptr ? module : "?";
+            if (index == 0) {
+                s_pending_recomp_bindings.clear();
+                s_pending_recomp_count = 0;
+                for (auto& candidate : s_recomp_modules) {
+                    candidate.base = 0;
+                    candidate.set_base(0);
+                }
+            }
+            const auto reject_batch = [] {
+                s_pending_recomp_bindings.clear();
+                s_pending_recomp_count = 0;
+                return false;
+            };
+            if (count == 0 || index >= count || index != s_pending_recomp_bindings.size() ||
+                (index != 0 && count != s_pending_recomp_count) || base == 0) {
+                LOG_ERROR(Frontend,
+                          "Invalid recompiled module batch at index {} (batch {}, available {})",
+                          index, count, s_recomp_modules.size());
+                return reject_batch();
+            }
+            if (index == 0) {
+                s_pending_recomp_count = count;
+            }
             if (build_id == nullptr || build_id_size != Core::RecompBuildIdSize ||
                 text_sha256 == nullptr || text_sha256_size != Core::RecompSha256Size) {
                 LOG_ERROR(Frontend, "Invalid identity while binding recompiled module '{}' (#{})",
                           module_name, index);
-                return false;
+                return reject_batch();
             }
 
             RecompModule* matched = nullptr;
@@ -757,22 +792,54 @@ int main(int argc, char** argv) {
                     LOG_ERROR(Frontend,
                               "Multiple recompiled images match module '{}' (#{}) identity",
                               module_name, index);
-                    return false;
+                    return reject_batch();
                 }
                 matched = &candidate;
             }
-            if (matched == nullptr || matched->set_base == nullptr) {
+            if (matched == nullptr) {
+                if (count == 1) {
+                    LOG_WARNING(
+                        Frontend,
+                        "No recompiled image matches single module '{}' (text {:#x}, base {:#x})",
+                        module_name, text_size, base);
+                    return reject_batch();
+                }
                 LOG_WARNING(
                     Frontend,
-                    "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x})",
+                    "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x}); "
+                    "using JIT fallback for this NSO",
                     module_name, index, text_size, base);
-                return false;
+            } else if (matched->set_base == nullptr) {
+                LOG_ERROR(Frontend,
+                          "Matched recompiled image for module '{}' has no base setter",
+                          module_name);
+                return reject_batch();
+            } else if (std::any_of(s_pending_recomp_bindings.begin(),
+                                   s_pending_recomp_bindings.end(),
+                                   [matched](const PendingRecompBinding& pending) {
+                                       return pending.module == matched;
+                                   })) {
+                LOG_ERROR(Frontend,
+                          "Recompiled image matched more than one loaded NSO in the same batch");
+                return reject_batch();
             }
 
-            matched->base = base;
-            matched->set_base(base);
-            LOG_INFO(Frontend, "Build-ID matched recompiled module '{}' (#{}) at {:#x}",
-                     module_name, index, base);
+            s_pending_recomp_bindings.push_back(
+                PendingRecompBinding{matched, base, index, module_name});
+            if (s_pending_recomp_bindings.size() != count) {
+                return true;
+            }
+            for (const PendingRecompBinding& pending : s_pending_recomp_bindings) {
+                if (pending.module == nullptr) {
+                    continue;
+                }
+                pending.module->base = pending.base;
+                pending.module->set_base(pending.base);
+                LOG_INFO(Frontend, "Build-ID matched recompiled module '{}' (#{}) at {:#x}",
+                         pending.name, pending.index, pending.base);
+            }
+            s_pending_recomp_bindings.clear();
+            s_pending_recomp_count = 0;
             return true;
         });
         // A window running native recompiled code is a standalone game export,
