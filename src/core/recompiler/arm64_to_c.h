@@ -450,8 +450,11 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
             if (rt != 31) {
                 snprintf(buf, sizeof buf, "c->x[%u]=recomp_load%s(c,%s);", rt, ty, addr.c_str());
                 put(buf);
+            } else {
+                snprintf(buf, sizeof buf, "(void)recomp_load%s(c,%s);", ty, addr.c_str());
+                put(buf);
             }
-        } else if (size < 3) {
+        } else if (size < 2 || (size == 2 && opc == 2)) {
             // Signed load: sign-extend from the accessed width.
             const char* st = size == 0 ? "int8_t" : size == 1 ? "int16_t" : "int32_t";
             if (rt != 31) {
@@ -460,9 +463,12 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 if (opc == 3) s += "_r &= 0xFFFFFFFFULL; ";   // 32-bit destination
                 s += "c->x[" + std::to_string(rt) + "] = _r; }";
                 put(s);
+            } else {
+                put("(void)recomp_load" + std::string(ty) + "(c," + addr + ");");
             }
         } else {
-            // size==3 with opc>=2 is not a defined load/store here.
+            // size==2/opc==3 and the size==3/opc>=2 combinations are not
+            // defined scalar loads/stores in this addressing class.
             snprintf(buf, sizeof buf,
                      "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
                      (unsigned long long)pc);
@@ -515,10 +521,15 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 if (rt != 31) {
                     s += "c->x[" + std::to_string(rt) + "]=recomp_load" + std::to_string(sz * 8) +
                          "(c," + addr + "); ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(sz * 8) + "(c," + addr + "); ";
                 }
                 if (rt2 != 31) {
                     s += "c->x[" + std::to_string(rt2) + "]=recomp_load" + std::to_string(sz * 8) +
                          "(c," + addr + "+" + std::to_string(sz) + "); ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(sz * 8) + "(c," + addr + "+" +
+                         std::to_string(sz) + "); ";
                 }
             } else {
                 s += "recomp_store" + std::to_string(sz * 8) + "(c," + addr + "," +
@@ -693,13 +704,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         s32 imm9 = (s32)((i >> 12) & 0x1FF);
         if (imm9 & 0x100) imm9 |= ~0x1FF;
         // mode 0 = LDUR/STUR, 1 = post-index, 3 = pre-index
-        if ((mode == 0 || mode == 1 || mode == 3) && size <= 3) {
-            // PRFUM is only a cache hint. Emit its no-op directly so the
-            // generated C does not declare an otherwise-unused address.
-            if (size == 3 && opc >= 2) {
-                put("/* prfum */");
-                return true;
-            }
+        // PRFUM is only the size=11/opc=10 unscaled form. The writeback forms
+        // and opc=11 are unallocated and must reach the fallback engine.
+        if (size == 3 && opc == 2 && mode == 0) {
+            put("/* prfum */");
+            return true;
+        }
+        if ((mode == 0 || mode == 1 || mode == 3) && size <= 3 &&
+            !(size == 2 && opc == 3) && !(size == 3 && opc >= 2)) {
             const u32 bits = 8u << size;
             std::string s = "{ uint64_t _b=c->x[" + std::to_string(rn) + "]; int64_t _o=" +
                             std::to_string((long long)imm9) + "; ";
@@ -720,13 +732,19 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 if (rt != 31) {
                     s += "c->x[" + std::to_string(rt) + "]=recomp_load" + std::to_string(bits) +
                          "(c," + addr + "); ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
                 }
-            } else if (rt != 31) {
-                s += "c->x[" + std::to_string(rt) + "]=(uint64_t)(int64_t)" + signed_cast +
-                     "recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
-                // opc==3 sign-extends into a 32-bit destination, so the result
-                // is truncated back to W width after the extension.
-                if (opc == 3) s += "c->x[" + std::to_string(rt) + "]&=0xFFFFFFFFULL; ";
+            } else {
+                if (rt != 31) {
+                    s += "c->x[" + std::to_string(rt) + "]=(uint64_t)(int64_t)" + signed_cast +
+                         "recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
+                    // opc==3 sign-extends into a 32-bit destination, so the result
+                    // is truncated back to W width after the extension.
+                    if (opc == 3) s += "c->x[" + std::to_string(rt) + "]&=0xFFFFFFFFULL; ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
+                }
             }
             if (mode == 1 || mode == 3) s += "c->x[" + std::to_string(rn) + "]=_b+_o; ";
             s += "}";
@@ -735,48 +753,17 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         }
     }
 
-    // Load/store exclusive and acquire/release.
-    //
-    // The non-exclusive acquire/release forms (LDAR/STLR, o2 set) are ordinary
-    // loads and stores as far as this backend is concerned - suyu's memory
-    // accessors are already atomic at these widths, and there is no weaker
-    // ordering here to fence against - so they are translated directly.
-    //
-    // The genuinely exclusive forms (LDXR/LDAXR/STXR/STLXR, o2 clear) are not.
-    // They used to become a plain load/store with STXR unconditionally
-    // reporting success, which is exact only when nothing else can touch the
-    // address. Under this backend real guest threads run concurrently, so an
-    // always-succeeds STXR makes every compare-and-swap non-atomic: two
-    // threads both "win" the same lock, the data it protects is then updated
-    // from both, and the next thread to wait on it spins forever. Hand these
-    // to the fallback engine, which owns the kernel's real exclusive monitor.
+    // Load/store exclusive, acquire/release, and atomic instructions. The C
+    // runtime memory helpers are plain accesses: wrapping them in fences would
+    // not make the accesses atomic and would still leave a C++ data race. Hand
+    // this complete encoding group to the fallback engine, which owns the
+    // kernel's exclusive monitor and implements the required memory ordering.
     if ((i & 0x3F000000) == 0x08000000) {
-        const u32 size = i >> 30, o2 = (i >> 23) & 1, L = (i >> 22) & 1, o1 = (i >> 21) & 1;
-        const u32 rt2 = (i >> 10) & 31, rn = (i >> 5) & 31, rt = i & 31;
-        // Pair variants (o1 set) are left to the fallback; only the single
-        // register forms are handled here.
-        if (!o1 && rt2 == 31) {
-            if (!o2) {
-                snprintf(buf, sizeof buf,
-                         "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;",
-                         i, (unsigned long long)pc);
-                put(buf);
-                return true;
-            }
-            const u32 bits = 8u << size;
-            const std::string addr = "c->x[" + std::to_string(rn) + "]";
-            if (L) {
-                // LDAR
-                if (rt != 31) {
-                    put("c->x[" + std::to_string(rt) + "] = recomp_load" +
-                        std::to_string(bits) + "(c," + addr + ");");
-                }
-            } else {
-                // STLR - no status register.
-                put("recomp_store" + std::to_string(bits) + "(c," + addr + "," + Xz(rt) + ");");
-            }
-            return true;
-        }
+        snprintf(buf, sizeof buf,
+                 "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
+                 (unsigned long long)pc);
+        put(buf);
+        return true;
     }
 
     // Data-processing 3-source: MADD/MSUB and the widening multiplies.
@@ -864,7 +851,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         // indexed read of an int32 array compiles to LDRSW with a register
         // offset - so leaving them out put thousands of real loads on the
         // fallback.
-        if (size <= 3 && !(opc >= 2 && size == 3)) {
+        if (size <= 3 && !(opc >= 2 && size == 3) && !(size == 2 && opc == 3)) {
             const u32 bits = 8u << size;
             std::string idx;
             switch (option) {
@@ -883,14 +870,22 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                     if (rt != 31) {
                         put("c->x[" + std::to_string(rt) + "] = recomp_load" +
                             std::to_string(bits) + "(c," + addr + ");");
+                    } else {
+                        put("(void)recomp_load" + std::to_string(bits) + "(c," + addr + ");");
                     }
-                } else if (rt != 31) {
-                    const char* st = size == 0 ? "int8_t" : size == 1 ? "int16_t" : "int32_t";
-                    std::string s = "{ uint64_t _r = (uint64_t)(int64_t)(" + std::string(st) +
-                                    ")recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
-                    if (opc == 3) s += "_r &= 0xFFFFFFFFULL; ";   // 32-bit destination
-                    s += "c->x[" + std::to_string(rt) + "] = _r; }";
-                    put(s);
+                } else {
+                    if (rt != 31) {
+                        const char* st =
+                            size == 0 ? "int8_t" : size == 1 ? "int16_t" : "int32_t";
+                        std::string s = "{ uint64_t _r = (uint64_t)(int64_t)(" +
+                                        std::string(st) + ")recomp_load" +
+                                        std::to_string(bits) + "(c," + addr + "); ";
+                        if (opc == 3) s += "_r &= 0xFFFFFFFFULL; "; // 32-bit destination
+                        s += "c->x[" + std::to_string(rt) + "] = _r; }";
+                        put(s);
+                    } else {
+                        put("(void)recomp_load" + std::to_string(bits) + "(c," + addr + ");");
+                    }
                 }
                 return true;
             }

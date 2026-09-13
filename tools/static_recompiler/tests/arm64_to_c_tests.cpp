@@ -32,6 +32,21 @@ void CheckPrefetchNoop(std::uint32_t instruction, std::string_view description) 
           "PRFUM emits a no-op without unused address temporaries");
 }
 
+void CheckDiscardedLoad(std::uint32_t instruction, std::string_view load,
+                        std::string_view description) {
+    std::string output;
+    Check(suyu::recomp::Translate(instruction, 0x1000, output), description);
+    Check(output.find(load) != std::string::npos,
+          "loads into the zero register still perform the memory access");
+}
+
+void CheckUnhandled(std::uint32_t instruction, std::string_view description) {
+    std::string output;
+    Check(suyu::recomp::Translate(instruction, 0x1000, output), description);
+    Check(output.find("recomp_unhandled") != std::string::npos,
+          "unallocated load encoding is handed to the fallback engine");
+}
+
 } // namespace
 
 int main() {
@@ -46,6 +61,19 @@ int main() {
     // so declaring address temporaries for it only creates compiler warnings in generated C.
     CheckPrefetchNoop(0xF8801120, "positive-offset PRFUM translates");
     CheckPrefetchNoop(0xF89C0100, "negative-offset PRFUM translates");
+
+    // Odyssey uses these LDUR WZR forms while probing memory. The destination is discarded,
+    // but the load itself must still happen (and the generated address temporaries must be used).
+    CheckDiscardedLoad(0xB85D019F, "(void)recomp_load32", "negative-offset LDUR WZR translates");
+    CheckDiscardedLoad(0xB85E819F, "(void)recomp_load32", "second LDUR WZR translates");
+
+    // size=10/opc=11 is unallocated, rather than a 32-bit sign-extending load.
+    CheckUnhandled(0xB9C0019F, "unsigned-offset unallocated load remains a fallback");
+    CheckUnhandled(0xB8C0019F, "unscaled unallocated load remains a fallback");
+    CheckUnhandled(0xB8ED699F, "register-offset unallocated load remains a fallback");
+    CheckUnhandled(0xF8C01120, "unallocated PRFUM opc remains a fallback");
+    CheckUnhandled(0xF8801520, "unallocated PRFUM writeback remains a fallback");
+    CheckUnhandled(0x88DFFD9F, "LDAR WZR retains acquire semantics through fallback");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
