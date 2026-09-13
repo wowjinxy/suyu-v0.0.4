@@ -173,4 +173,24 @@ if((BUILD_TESTING OR YUZU_TESTS) AND NOT CMAKE_CROSSCOMPILING)
             "-P" "${CMAKE_CURRENT_LIST_DIR}/tests/nso_emit.cmake"
     )
     set_tests_properties(static_recompiler_nso_emit PROPERTIES TIMEOUT 120)
+
+    if(WIN32)
+        find_program(SUYU_RECOMPILER_POWERSHELL NAMES pwsh powershell)
+        if(SUYU_RECOMPILER_POWERSHELL)
+            add_test(
+                NAME static_recompiler_package_deconstructed
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DPOWERSHELL=${SUYU_RECOMPILER_POWERSHELL}"
+                    "-DPACKAGE_SCRIPT=${CMAKE_CURRENT_LIST_DIR}/package_deconstructed.ps1"
+                    "-DPACKAGE_SCHEMA=${CMAKE_CURRENT_LIST_DIR}/recomp_package.schema.json"
+                    "-DRECOMP_TOOL=$<TARGET_FILE:suyu_recomp>"
+                    "-DNSO_TEST_HELPER=$<TARGET_FILE:nso_image_tests>"
+                    "-DRECOMP_PACKAGE_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/package_deconstructed"
+                    "-P" "${CMAKE_CURRENT_LIST_DIR}/tests/package_deconstructed.cmake"
+            )
+            set_tests_properties(static_recompiler_package_deconstructed PROPERTIES TIMEOUT 120)
+        else()
+            message(STATUS "PowerShell was not found; skipping deconstructed package test")
+        endif()
+    endif()
 endif()

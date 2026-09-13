@@ -91,7 +91,11 @@ rasterizer, and runtime shader translation.
 
 - Link verified per-module AOT objects into a per-title `suyu-cmd` runtime.
 - Refuse module/build-ID mismatches instead of attempting to run stale output.
-- Package runtime code and user configuration only; generated title code remains local.
+- Provide a local Windows packager for a user-supplied plaintext deconstructed tree. Emit an
+  audited manifest, deterministic checksums, explicit application/applet launch parameters, and a
+  title-specialized hosted runtime without ever launching it during packaging.
+- Distribute runtime code and user configuration only. Generated title code, title-specialized
+  executables, and copied title content remain local.
 
 ## Immediate correctness work
 

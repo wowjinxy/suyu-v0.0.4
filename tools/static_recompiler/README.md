@@ -94,6 +94,61 @@ decode.
 `inspect-nso` consumes already-decrypted module bytes. It neither accepts nor manages console
 keys, NSP/XCI/NCA containers, updates, or mods.
 
+## Package a local deconstructed title on Windows
+
+`package_deconstructed.ps1` creates a reproducible, local-only hosted-runtime package from a
+plaintext deconstructed title tree that you supplied. The minimum input is:
+
+```text
+<input>/
+  exefs/
+    main
+    main.npdm
+  romfs/              # optional extracted RomFS
+```
+
+A packed sibling file named `romfs` or `romfs.bin`, or `exefs/romfs.bin`, is also supported when
+no extracted `romfs` directory is present. The packager discovers the canonical NSO set (`rtld`,
+`main`, `subsdk0` through `subsdk9`, then `sdk`), inspects and emits each module, generates static
+registration, and either builds or copies a hosted `suyu-cmd-static` executable. It never launches
+the host or any title code.
+
+Use fresh work and output paths. Both must be outside the input tree and, by default, must either
+be outside the source checkout or be ignored by Git:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  tools/static_recompiler/package_deconstructed.ps1 `
+  -InputRoot "D:\legal-dump\extracted" `
+  -WorkRoot "build\local-title\work" `
+  -OutputRoot "build\local-title\package" `
+  -RecompilerPath "build\static_recompiler\Release\suyu_recomp.exe" `
+  -HostBuildRoot "build\suyu-msvc"
+```
+
+For a deconstructed system applet such as qlaunch, add the explicit frontend launch tuple:
+
+```powershell
+  -LaunchMode Applet -AppletId 3 `
+  -AppletType SystemApplet -LaunchType FrontendInitiated
+```
+
+`-HostBuildRoot` must name an already configured 64-bit suyu build; the script reconfigures it with
+the generated module directory and builds `suyu-cmd-static`. Builds use four parallel jobs by
+default; set `-BuildJobs` to choose a different bounded value. For development or synthetic tests,
+`-StaticHostPath` can instead copy an already-built matching host. That mode records a warning in
+the manifest because the packager cannot prove which generated modules were linked into an
+arbitrary supplied executable.
+
+The output contains `suyu-recompiled.exe`, a quoted `launch.cmd`, the input `exefs` and optional
+RomFS, `recomp_package.json`, and `SHA256SUMS`. The manifest records the program ID, NPDM identity,
+module build IDs and mapped-text identities, launch parameters, tool/source provenance, and host
+identity. Runtime registration independently refuses a mismatched live module identity.
+
+This script does not decrypt content, accept keys, or produce a distributable artifact. Generated
+code, the title-specialized executable, and copied title content must remain local and must not be
+committed.
+
 ## Test
 
 ```sh
@@ -101,10 +156,12 @@ ctest --test-dir build/static_recompiler --output-on-failure
 ```
 
 The tests validate malformed NSO and NPDM ranges, architecture gating, MOD0 probing, optional LZ4
-behavior, JSON inspection, raw emission, and complete NSO emission. Both emission tests build and
-run the generated native project. The NSO test loads values from separated rodata/data addresses,
-computes `5 + 7 = 12`, and writes through the zeroed BSS mapping. It runs with and without save-data
-initialization and verifies that no whole-process autosave can replace the freshly loaded module.
+behavior, JSON inspection, raw emission, complete NSO emission, and deterministic local package
+assembly. Both emission tests build and run the generated native project. The package test uses a
+synthetic NSO/NPDM, copies a deliberately non-executable fake host, and never launches that host.
+The NSO test loads values from separated rodata/data addresses, computes `5 + 7 = 12`, and writes
+through the zeroed BSS mapping. It runs with and without save-data initialization and verifies that
+no whole-process autosave can replace the freshly loaded module.
 
 Only use executable content that you are legally allowed to analyze. Do not commit console keys,
 game dumps, extracted assets, or generated code derived from proprietary titles.
