@@ -65,6 +65,15 @@ struct NsoRelaTable {
     std::vector<NsoRelaRecord> records;
 };
 
+struct NsoSysvHashInfo {
+    /// Module-relative address from DT_HASH.
+    std::uint64_t address{};
+    std::uint64_t byte_size{};
+    std::uint32_t bucket_count{};
+    /// The SysV hash chain count is the exact dynamic-symbol count.
+    std::uint32_t chain_count{};
+};
+
 struct NsoDynamicInfo {
     NsoMod0Header mod0;
     std::uint64_t dynamic_address{};
@@ -76,6 +85,7 @@ struct NsoDynamicInfo {
     std::optional<std::uint64_t> string_table_address;
     std::optional<std::uint64_t> string_table_size;
     std::optional<std::uint64_t> symbol_table_address;
+    std::optional<NsoSysvHashInfo> sysv_hash;
     std::uint64_t symbol_entry_size{NsoElf64SymbolEntrySize};
     std::uint64_t rela_entry_size{NsoElf64RelaEntrySize};
     /// Defaults to DT_RELA when omitted, matching the NSO AArch64 convention.

@@ -15,6 +15,7 @@ namespace suyu::recomp {
 
 constexpr std::uint64_t DefaultNsoDynamicSymbolLimit = 1'000'000;
 constexpr std::uint64_t DefaultNsoDynamicSymbolNameBytesLimit = std::uint64_t{64} << 20;
+constexpr std::uint64_t DefaultNsoDynamicStringTableLimit = std::uint64_t{64} << 20;
 
 constexpr std::uint8_t NsoElfSymbolBindingLocal = 0;
 constexpr std::uint8_t NsoElfSymbolBindingGlobal = 1;
@@ -29,7 +30,7 @@ constexpr std::uint16_t NsoElfSectionLowReserved = 0xFF00;
 constexpr std::uint16_t NsoElfSectionAbsolute = 0xFFF1;
 constexpr std::uint16_t NsoElfSectionCommon = 0xFFF2;
 
-/// One bounded Elf64_Sym record and its name from the NSO header's dynsym/dynstr extents.
+/// One bounded Elf64_Sym record and its name from proven dynsym/dynstr extents.
 struct NsoDynamicSymbol {
     std::uint32_t index{};
     std::uint64_t address{};
@@ -100,5 +101,14 @@ NsoDynamicSymbolParseResult ParseNsoDynamicSymbols(
     const DecodedNso& image, const NsoDynamicInfo& dynamic,
     std::uint64_t max_symbols = DefaultNsoDynamicSymbolLimit,
     std::uint64_t max_name_bytes = DefaultNsoDynamicSymbolNameBytesLimit);
+
+/// Parses a live module's exact dynamic-symbol count from its validated SysV DT_HASH metadata.
+/// The hash, symbol, and string extents must all be readable through `module`; no guest code is
+/// executed. This is the hosted-runtime counterpart to the DecodedNso overload.
+NsoDynamicSymbolParseResult ParseNsoDynamicSymbols(
+    const NsoModuleView& module, const NsoDynamicInfo& dynamic,
+    std::uint64_t max_symbols = DefaultNsoDynamicSymbolLimit,
+    std::uint64_t max_name_bytes = DefaultNsoDynamicSymbolNameBytesLimit,
+    std::uint64_t max_string_table_bytes = DefaultNsoDynamicStringTableLimit);
 
 } // namespace suyu::recomp

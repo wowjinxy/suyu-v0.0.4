@@ -19,6 +19,7 @@ constexpr std::uint64_t MinimumMod0HeaderSize = 0x1C;
 
 constexpr std::int64_t DtNull = 0;
 constexpr std::int64_t DtPltRelSize = 2;
+constexpr std::int64_t DtHash = 4;
 constexpr std::int64_t DtStringTable = 5;
 constexpr std::int64_t DtSymbolTable = 6;
 constexpr std::int64_t DtRela = 7;
@@ -46,6 +47,7 @@ struct DynamicTags {
     std::optional<std::uint64_t> string_table_size;
     std::optional<std::uint64_t> symbol_table_address;
     std::optional<std::uint64_t> symbol_entry_size;
+    std::optional<std::uint64_t> hash_table_address;
     std::optional<std::uint64_t> rel_address;
     std::optional<std::uint64_t> rel_size;
     std::optional<std::uint64_t> rel_entry_size;
@@ -130,6 +132,8 @@ bool CaptureDynamicTag(std::int64_t tag, std::uint64_t value, DynamicTags& tags,
     switch (tag) {
     case DtPltRelSize:
         return StoreUnique(tags.plt_rela_size, value, "DT_PLTRELSZ", error);
+    case DtHash:
+        return StoreUnique(tags.hash_table_address, value, "DT_HASH", error);
     case DtStringTable:
         return StoreUnique(tags.string_table_address, value, "DT_STRTAB", error);
     case DtSymbolTable:
@@ -468,6 +472,42 @@ NsoDynamicParseResult ParseNsoDynamic(const NsoModuleView& module, std::size_t m
         return result;
     }
 
+    if (tags.hash_table_address) {
+        const std::uint64_t address = *tags.hash_table_address;
+        if ((address & 3) != 0) {
+            result.error = "DT_HASH is not 4-byte aligned";
+            return result;
+        }
+        std::array<std::uint8_t, 8> header{};
+        if (!ReadModule(module, address, header)) {
+            result.error = "DT_HASH does not point to a complete readable header";
+            return result;
+        }
+        const std::uint32_t bucket_count = ReadU32(header);
+        const std::uint32_t chain_count = ReadU32(header, 4);
+        if (bucket_count == 0 || chain_count == 0) {
+            result.error = "DT_HASH has a zero bucket or chain count";
+            return result;
+        }
+        const std::uint64_t word_count =
+            std::uint64_t{2} + bucket_count + static_cast<std::uint64_t>(chain_count);
+        const std::uint64_t byte_size = word_count * sizeof(std::uint32_t);
+        if (!RangeFits(address, byte_size, module.image_size)) {
+            result.error = "DT_HASH extent lies outside the module image";
+            return result;
+        }
+        if (RangesOverlap(address, byte_size, info.dynamic_address, info.dynamic_byte_size)) {
+            result.error = "DT_HASH extent overlaps the dynamic table";
+            return result;
+        }
+        info.sysv_hash = NsoSysvHashInfo{
+            .address = address,
+            .byte_size = byte_size,
+            .bucket_count = bucket_count,
+            .chain_count = chain_count,
+        };
+    }
+
     info.string_table_address = tags.string_table_address;
     info.string_table_size = tags.string_table_size;
     if (!ValidateAddressSizePair(module, tags.string_table_address, tags.string_table_size,
@@ -577,6 +617,12 @@ NsoDynamicParseResult ParseNsoDynamic(const DecodedNso& image, std::size_t max_d
                                 *result.info->string_table_size)) {
         result.info.reset();
         result.error = "DT_STRTAB/DT_STRSZ extent contains unreadable decoded NSO bytes";
+    }
+    if (result && result.info->sysv_hash &&
+        !DecodedRangeIsReadable(image, result.info->sysv_hash->address,
+                                result.info->sysv_hash->byte_size)) {
+        result.info.reset();
+        result.error = "DT_HASH extent contains unreadable decoded NSO bytes";
     }
     return result;
 }
