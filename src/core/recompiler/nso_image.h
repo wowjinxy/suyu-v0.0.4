@@ -96,6 +96,10 @@ struct NsoDecodeResult {
 /// Inspects and structurally validates an NSO0 image without decoding its segments.
 NsoInspection InspectNso(std::span<const std::uint8_t> file);
 
+/// Validates the page-aligned, ordered destination layout required to load an executable NSO.
+/// Returns an empty string when the layout is valid, otherwise a user-facing error.
+std::string ValidateNsoExecutableLayout(const NsoInfo& info);
+
 /// Decodes every segment in a structurally valid NSO0 image. The callback is needed only when a
 /// segment uses LZ4. ZBIC decoding is intentionally not implemented yet.
 NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file,

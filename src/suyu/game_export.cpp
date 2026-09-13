@@ -60,6 +60,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
 #include "core/recompiler/arm64_to_c.h"
+#include "core/recompiler/npdm_info.h"
 #include "core/recompiler/nso_image.h"
 
 // ---------------------------------------------------------------------------
@@ -585,6 +586,7 @@ struct NsoAnalysisResult {
     u32 rodata_size{};
     u32 data_vaddr{};
     u32 data_size{};
+    u32 bss_size{};
     u32 total_blocks{};
     u32 total_instructions{};
     /// Guest address of the first real instruction. An NSO's .text does not
@@ -851,6 +853,12 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     }
 
     const auto& info = decoded.image->info;
+    const std::string layout_error = suyu::recomp::ValidateNsoExecutableLayout(info);
+    if (!layout_error.empty()) {
+        LOG_WARNING(Frontend, "NSO {} has an invalid executable layout: {}", nso_file->GetName(),
+                    layout_error);
+        return std::nullopt;
+    }
 
     NsoAnalysisResult result{};
     result.name = QString::fromStdString(nso_file->GetName());
@@ -863,11 +871,17 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     result.rodata_size = info.segments[1].decoded_size;
     result.data_vaddr = info.segments[2].memory_offset;
     result.data_size = info.segments[2].decoded_size;
+    result.bss_size = info.bss_size;
     result.text_bytes = std::move(decoded.image->segments[0]);
     result.rodata_bytes = std::move(decoded.image->segments[1]);
     result.data_bytes = std::move(decoded.image->segments[2]);
-    result.entry_vaddr = static_cast<u64>(result.text_vaddr) +
-                         suyu::recomp::FindNsoAarch64EntryOffset(result.text_bytes);
+    const u32 entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(result.text_bytes);
+    if (entry_offset == 0) {
+        LOG_WARNING(Frontend, "Could not validate the AArch64 entry stub in NSO {}",
+                    nso_file->GetName());
+        return std::nullopt;
+    }
+    result.entry_vaddr = static_cast<u64>(result.text_vaddr) + entry_offset;
 
     // Use the same block discovery implementation as the CLI and emitter. The old frontend-local
     // sweep missed conditional branch targets and could therefore report a different block map.
@@ -1308,6 +1322,31 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     const QString requested_backend_name =
         ballistic_requested ? QStringLiteral("ballistic") : QStringLiteral("dynarmic");
     const QString effective_backend_name = QStringLiteral("dynarmic");
+    const auto reject_npdm = [this](const QString& message) {
+        LOG_ERROR(Frontend, "AOT export rejected main.npdm: {}", message.toStdString());
+        QMessageBox::critical(this, tr("AOT Export Failed"), message);
+        return false;
+    };
+    const auto validate_npdm = [this, &reject_npdm](std::span<const u8> bytes) {
+        auto inspection = suyu::recomp::InspectNpdm(bytes);
+        if (!inspection) {
+            return reject_npdm(tr("The ExeFS main.npdm is invalid:\n%1")
+                                   .arg(QString::fromStdString(inspection.error)));
+        }
+        for (const std::string& warning : inspection.warnings) {
+            LOG_WARNING(Frontend, "main.npdm: {}", warning);
+        }
+        if (inspection.info->architecture != suyu::recomp::NpdmArchitecture::Aarch64) {
+            return reject_npdm(
+                tr("This title declares AArch32 in main.npdm. The static recompiler currently "
+                   "supports only AArch64 titles."));
+        }
+        if (!inspection.info->address_space) {
+            return reject_npdm(
+                tr("This title uses an unsupported process address-space value in main.npdm."));
+        }
+        return true;
+    };
 
     // A completed export is immutable for a given game/output directory and
     // scan mode. Reusing it makes re-opening the export dialog or packaging
@@ -1323,13 +1362,16 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const bool same_backend = contents.contains(
                 QStringLiteral("\"effective_backend\": \"") + effective_backend_name +
                 QStringLiteral("\""));
+            const bool architecture_validated =
+                contents.contains(QStringLiteral("\"architecture\": \"aarch64-npdm\""));
             const bool has_recompiled_project =
                 QDir(cache_dir + QDir::separator() + QStringLiteral("exefs")).exists();
             const bool has_required_launcher =
                 !WantsCompiledOutput() ||
                 QFile::exists(cache_dir + QDir::separator() + QStringLiteral("launcher") +
                               QDir::separator() + QStringLiteral("static_launcher.exe"));
-            if (same_scan && same_backend && has_recompiled_project && has_required_launcher) {
+            if (same_scan && same_backend && architecture_validated && has_recompiled_project &&
+                has_required_launcher) {
                 LOG_INFO(Frontend, "Reusing completed AOT cache at {}", cache_dir.toStdString());
                 return cache_dir;
             }
@@ -1349,6 +1391,19 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         LOG_INFO(Frontend, "AOT diag: ExtractExeFsFromRom took {} ms",
                  std::chrono::duration_cast<std::chrono::milliseconds>(t_extract_end - t_extract_start).count());
         if (exefs_vdir) {
+            const auto npdm_file = exefs_vdir->GetFile("main.npdm");
+            if (!npdm_file) {
+                reject_npdm(tr("The ExeFS does not contain main.npdm."));
+                return {};
+            }
+            if (npdm_file->GetSize() > suyu::recomp::MaximumNpdmSize) {
+                reject_npdm(tr("The ExeFS main.npdm exceeds the supported size limit."));
+                return {};
+            }
+            const std::vector<u8> npdm_bytes = npdm_file->ReadAllBytes();
+            if (!validate_npdm(npdm_bytes)) {
+                return {};
+            }
             used_vfs = true;
             const auto t_getfiles_start = std::chrono::steady_clock::now();
             const auto nso_files = exefs_vdir->GetFiles();
@@ -1399,6 +1454,20 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
 
     // Fallback: read NSO files from the extracted exefs directory on disk
     if (!used_vfs && QDir(exefs_dir).exists()) {
+        QFile npdm_file(QDir(exefs_dir).filePath(QStringLiteral("main.npdm")));
+        if (!npdm_file.open(QIODevice::ReadOnly)) {
+            reject_npdm(tr("The ExeFS does not contain a readable main.npdm."));
+            return {};
+        }
+        if (npdm_file.size() > static_cast<qint64>(suyu::recomp::MaximumNpdmSize)) {
+            reject_npdm(tr("The ExeFS main.npdm exceeds the supported size limit."));
+            return {};
+        }
+        const QByteArray npdm_bytes = npdm_file.readAll();
+        if (!validate_npdm(std::span<const u8>{reinterpret_cast<const u8*>(npdm_bytes.constData()),
+                                               static_cast<size_t>(npdm_bytes.size())})) {
+            return {};
+        }
         CopyDirectoryRecursive(exefs_dir, cache_dir + QDir::separator() + QStringLiteral("exefs"));
 
         // RealVfsFile holds a raw RealVfsFilesystem& (not a shared_ptr), so a
@@ -1508,7 +1577,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 mod.rodata_bytes.empty() ? nullptr : mod.rodata_bytes.data(),
                 mod.rodata_bytes.size(),
                 mod.data_bytes.empty() ? nullptr : mod.data_bytes.data(), mod.data_bytes.size(),
-                mod.entry_vaddr, game_name.toStdString(), &exported_roots);
+                mod.entry_vaddr, game_name.toStdString(), &exported_roots,
+                suyu::recomp::RecompileImageLayout{mod.rodata_vaddr, mod.data_vaddr,
+                                                   mod.bss_size});
             emit_ok = true;
         } catch (const std::exception& e) {
             LOG_ERROR(Frontend, "EmitProject failed for module {}: {}", mod.name.toStdString(),
@@ -2000,6 +2071,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         out << "  \"version\": 2,\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
         out << "  \"effective_backend\": \"" << effective_backend_name << "\",\n";
+        out << "  \"architecture\": \"aarch64-npdm\",\n";
         out << "  \"full_scan\": " << (full_scan ? "true" : "false") << ",\n";
         out << "  \"total_modules\": " << module_results.size() << ",\n";
         out << "  \"total_blocks_analyzed\": " << total_blocks << ",\n";

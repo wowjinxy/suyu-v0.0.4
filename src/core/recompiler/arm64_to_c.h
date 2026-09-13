@@ -1851,6 +1851,15 @@ struct RecompileStats {
     size_t translated_terminators = 0;
 };
 
+// Module-relative virtual addresses needed by the generated standalone loader. Hosted suyu uses
+// its own already-mapped process memory, but a portable emitted executable must reproduce the NSO
+// segment layout exactly instead of placing every bundled file at the start of its flat buffer.
+struct RecompileImageLayout {
+    u64 rodata_vaddr{};
+    u64 data_vaddr{};
+    u64 bss_size{};
+};
+
 // Emit a buildable C project that statically recompiles `text` (raw AArch64 .text at `base`).
 // Layout written into out_dir:
 //   CMakeLists.txt, main.c, recomp_export.c, recomp_runtime.{c,h}   <- hand-readable top level
@@ -1875,7 +1884,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                                   // Addresses of this module's exported dynsym symbols, so
                                   // block discovery seeds a root at each even when nothing in
                                   // this module's own .text branches there directly.
-                                  const std::vector<u64>* extra_roots = nullptr) {
+                                  const std::vector<u64>* extra_roots = nullptr,
+                                  RecompileImageLayout image_layout = {}) {
     (void)source_only; // Kept in the public API for compatibility; this function only emits files.
     if (!IsModuleIdentifier(mod)) {
         throw std::invalid_argument(
@@ -1899,6 +1909,64 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         throw std::invalid_argument("a segment size was provided without segment data");
     }
     const u64 text_end = base + static_cast<u64>(n_bytes);
+    const auto checked_end = [](u64 address, u64 size, const char* name) {
+        if (size > std::numeric_limits<u64>::max() - address) {
+            throw std::invalid_argument(std::string{name} + " address range overflows 64 bits");
+        }
+        return address + size;
+    };
+    const auto ranges_overlap = [](u64 first, u64 first_end, u64 second, u64 second_end) {
+        return first < second_end && second < first_end;
+    };
+    u64 image_end = text_end;
+    u64 rodata_end = image_layout.rodata_vaddr;
+    if (rodata_size != 0) {
+        if (image_layout.rodata_vaddr < base) {
+            throw std::invalid_argument("rodata must lie inside the standalone memory window");
+        }
+        rodata_end = checked_end(image_layout.rodata_vaddr, static_cast<u64>(rodata_size),
+                                 "rodata");
+        if (ranges_overlap(base, text_end, image_layout.rodata_vaddr, rodata_end)) {
+            throw std::invalid_argument("text and rodata ranges overlap");
+        }
+        image_end = std::max(image_end, rodata_end);
+    }
+    u64 data_end = image_layout.data_vaddr;
+    u64 data_and_bss_end = image_layout.data_vaddr;
+    if (data_size != 0 || image_layout.bss_size != 0) {
+        if (image_layout.data_vaddr < base) {
+            throw std::invalid_argument("data/BSS must lie inside the standalone memory window");
+        }
+        data_end = checked_end(image_layout.data_vaddr, static_cast<u64>(data_size), "data");
+        data_and_bss_end = checked_end(data_end, image_layout.bss_size, "BSS");
+        if (ranges_overlap(base, text_end, image_layout.data_vaddr, data_and_bss_end)) {
+            throw std::invalid_argument("text and data/BSS ranges overlap");
+        }
+        if (rodata_size != 0 &&
+            ranges_overlap(image_layout.rodata_vaddr, rodata_end, image_layout.data_vaddr,
+                           data_and_bss_end)) {
+            throw std::invalid_argument("rodata and data/BSS ranges overlap");
+        }
+        image_end = std::max(image_end, data_and_bss_end);
+    }
+    constexpr u64 MinimumGuestMemorySize = 256ULL * 1024 * 1024;
+    constexpr u64 RuntimeTailSize = 128ULL * 1024 * 1024;
+    constexpr u64 StackReserveSize = 1ULL * 1024 * 1024;
+    u64 aligned_image_size = image_end - base;
+    if (aligned_image_size > std::numeric_limits<u64>::max() - 0xFFF) {
+        throw std::invalid_argument("standalone memory window is too large");
+    }
+    aligned_image_size = (aligned_image_size + 0xFFF) & ~0xFFFULL;
+    if (aligned_image_size > std::numeric_limits<u64>::max() - RuntimeTailSize) {
+        throw std::invalid_argument("standalone image leaves no room for runtime memory");
+    }
+    const u64 guest_memory_size =
+        std::max(MinimumGuestMemorySize, aligned_image_size + RuntimeTailSize);
+    if (guest_memory_size > std::numeric_limits<u64>::max() - base) {
+        throw std::invalid_argument("standalone memory window overflows 64 bits");
+    }
+    const u64 heap_base = base + std::max(guest_memory_size / 2, aligned_image_size);
+    const u64 heap_end = base + guest_memory_size - StackReserveSize;
     if (entry_pc != 0 && ((entry_pc & 3) != 0 || entry_pc < base || entry_pc >= text_end)) {
         throw std::invalid_argument("entry PC must be aligned and inside text");
     }
@@ -2120,7 +2188,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     std::ostringstream mc;
     mc << "#include \"recomp_runtime.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n";
     mc << "#ifdef HAVE_SDL2\n#include <SDL2/SDL.h>\n#endif\n\n";
-    mc << "#define GUEST_MEM_SIZE (256ULL * 1024 * 1024) /* 256 MB */\n\n";
+    mc << "#define GUEST_MEM_SIZE (0x" << std::hex << guest_memory_size << std::dec
+       << "ULL) /* includes the complete module image */\n\n";
     mc << "static const char* kGameTitle = \"" << title_str << "\";\n\n";
     mc << "#ifdef HAVE_SDL2\n";
     mc << "static SDL_Window*   g_sdl_window   = NULL;\n";
@@ -2160,13 +2229,16 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "  } else {\n";
     mc << "    fprintf(stderr, \"[recomp] SDL2 init failed: %s (running headless)\\n\", SDL_GetError());\n";
     mc << "  }\n#endif\n\n";
+    mc << "  if(GUEST_MEM_SIZE > (uint64_t)(size_t)-1){\n";
+    mc << "    fprintf(stderr,\"Guest memory is too large for this host\\n\"); return 1;\n";
+    mc << "  }\n";
     mc << "  uint8_t* mem = (uint8_t*)calloc(1, (size_t)GUEST_MEM_SIZE);\n";
     mc << "  if(!mem){ fprintf(stderr,\"Failed to allocate guest memory\\n\"); return 1; }\n";
     mc << "  GuestContext c; memset(&c,0,sizeof c);\n";
     mc << "  c.mem=mem; c.mem_size=GUEST_MEM_SIZE;\n";
     mc << "  c.mem_base_vaddr=0x" << std::hex << base << std::dec << "ULL;\n";
-    mc << "  c.heap_base=c.mem_base_vaddr+GUEST_MEM_SIZE/2;\n";
-    mc << "  c.heap_cur=c.heap_base; c.heap_end=c.mem_base_vaddr+GUEST_MEM_SIZE;\n";
+    mc << "  c.heap_base=0x" << std::hex << heap_base << "ULL;\n";
+    mc << "  c.heap_cur=c.heap_base; c.heap_end=0x" << heap_end << std::dec << "ULL;\n";
     mc << "  c.x[31]=c.mem_base_vaddr + GUEST_MEM_SIZE - 16; /* SP */\n";
     mc << "  c.pc=0x" << std::hex << (entry_pc ? entry_pc : base) << std::dec << "ULL;\n\n";
     mc << "  if(use_save) recomp_save_init(&c, argv[0]);\n\n";
@@ -2174,12 +2246,12 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "    snprintf(data_dir,sizeof data_dir,\"%s\",argv[0]);\n";
     mc << "    char* sl=strrchr(data_dir,'\\\\'); if(!sl) sl=strrchr(data_dir,'/'); if(sl) *(sl+1)=0; else data_dir[0]=0;\n";
     mc << "    strncat(data_dir,\"data\",sizeof(data_dir)-strlen(data_dir)-1);\n";
-    mc << "    recomp_load_segments(&c,data_dir);\n  }\n\n";
-    mc << "  if(use_save) { uint64_t sz=0;\n";
-    mc << "    if(recomp_save_exists(&c,\"autosave.bin\")){\n";
-    mc << "      recomp_save_read(&c,\"autosave.bin\",c.mem,(uint64_t)GUEST_MEM_SIZE,&sz);\n";
-    mc << "      printf(\"[recomp] Restored autosave (%llu bytes)\\n\",(unsigned long long)sz);\n";
-    mc << "    }\n  }\n\n";
+    mc << "    if(!recomp_load_segments(&c,data_dir,"
+       << "0x" << std::hex << base << "ULL,0x" << n_bytes << "ULL,"
+       << "0x" << image_layout.rodata_vaddr << "ULL,0x" << rodata_size << "ULL,"
+       << "0x" << image_layout.data_vaddr << "ULL,0x" << data_size << "ULL,"
+       << "0x" << image_layout.bss_size << "ULL)) { free(mem); return 1; }\n"
+       << std::dec << "  }\n\n";
     mc << "  printf(\"[recomp] Starting at pc=0x%llx\\n\",(unsigned long long)c.pc);\n";
     mc << "  /* Main loop: pump SDL events while the guest runs */\n";
     mc << "#ifdef HAVE_SDL2\n";
@@ -2190,7 +2262,6 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "#else\n";
     mc << "  recomp_run(&c);\n";
     mc << "#endif\n\n";
-    mc << "  if(use_save) recomp_save_write(&c,\"autosave.bin\",c.mem,(uint64_t)GUEST_MEM_SIZE);\n";
     mc << "  printf(\"[recomp] halted at pc=0x%llx\\n\",(unsigned long long)c.pc);\n";
     mc << "#ifdef HAVE_SDL2\n";
     mc << "  if(g_sdl_texture)  SDL_DestroyTexture(g_sdl_texture);\n";
@@ -2211,6 +2282,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "  project(suyu_recompiled C)\n"
        << "else()\n"
        << "  enable_language(C)\n"
+       << "endif()\n"
+       << "if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)\n"
+       << "  message(FATAL_ERROR \"Generated recompiled projects require a 64-bit host\")\n"
        << "endif()\n"
        << "set(CMAKE_C_STANDARD 11)\n"
        << "include_directories(${CMAKE_CURRENT_SOURCE_DIR})\n"
@@ -2587,8 +2661,11 @@ int  recomp_save_write(GuestContext* c, const char* name, const void* data, uint
 int  recomp_save_read(GuestContext* c, const char* name, void* buf, uint64_t buf_size, uint64_t* out_size);
 int  recomp_save_delete(GuestContext* c, const char* name);
 int  recomp_save_exists(GuestContext* c, const char* name);
-/* Load bundled data segments into guest memory */
-int  recomp_load_segments(GuestContext* c, const char* data_dir);
+/* Load bundled segments at their exact module-relative guest addresses and zero BSS. */
+int  recomp_load_segments(GuestContext* c, const char* data_dir,
+                          uint64_t text_vaddr, uint64_t text_size,
+                          uint64_t rodata_vaddr, uint64_t rodata_size,
+                          uint64_t data_vaddr, uint64_t data_size, uint64_t bss_size);
 #endif
 )RT";
 }
@@ -2742,25 +2819,62 @@ int recomp_save_exists(GuestContext* c, const char* name) {
   if(f){fclose(f); return 1;} return 0;
 }
 
-/* ── Segment loader: loads rodata.bin + data.bin from the data dir into guest memory ── */
+/* ── Checked segment loader ── */
 
-int recomp_load_segments(GuestContext* c, const char* data_dir) {
-  const char* names[]={"rodata.bin","data.bin","text.bin"};
-  /* Corresponding offsets from segment info embedded in manifest — for now, load
-     sequentially after .text in memory. The real offsets come from the blockmap. */
-  for(int i=0;i<3;i++){
-    char path[1024];
-    snprintf(path,sizeof path,"%s%c%s",data_dir,PATH_SEP,names[i]);
-    FILE* f=fopen(path,"rb");
-    if(!f) continue;
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    if((uint64_t)sz<=c->mem_size){
-      /* Load at the appropriate offset — text at base, others after */
-      fread(c->mem,1,(size_t)sz,f);
-    }
-    fclose(f);
-    printf("[recomp] Loaded segment %s (%ld bytes)\n",names[i],sz);
+static int load_segment(GuestContext* c,const char* data_dir,const char* name,
+                        uint64_t vaddr,uint64_t expected_size){
+  char path[1024]; FILE* f; long measured; uint8_t* destination; size_t read_size;
+  int path_size,close_result;
+  if(expected_size==0) return 1;
+  if(expected_size>(uint64_t)(size_t)-1){
+    fprintf(stderr,"[recomp] Segment is too large for this host: %s\n",name); return 0;
   }
+  path_size=snprintf(path,sizeof path,"%s%c%s",data_dir,PATH_SEP,name);
+  if(path_size<0 || (size_t)path_size>=sizeof path){
+    fprintf(stderr,"[recomp] Segment path is too long: %s\n",name); return 0;
+  }
+  f=fopen(path,"rb");
+  if(!f){ fprintf(stderr,"[recomp] Missing segment %s\n",path); return 0; }
+  if(fseek(f,0,SEEK_END)!=0 || (measured=ftell(f))<0 || fseek(f,0,SEEK_SET)!=0){
+    fprintf(stderr,"[recomp] Could not measure segment %s\n",path); fclose(f); return 0;
+  }
+  if((uint64_t)measured!=expected_size){
+    fprintf(stderr,"[recomp] Segment %s has %ld bytes; expected %llu\n",name,measured,
+            (unsigned long long)expected_size); fclose(f); return 0;
+  }
+  destination=memptr(c,vaddr,expected_size);
+  if(!destination){
+    fprintf(stderr,"[recomp] Segment %s lies outside guest memory\n",name); fclose(f); return 0;
+  }
+  read_size=fread(destination,1,(size_t)expected_size,f);
+  close_result=fclose(f);
+  if(read_size!=(size_t)expected_size || close_result!=0){
+    fprintf(stderr,"[recomp] Could not read complete segment %s\n",path); return 0;
+  }
+  printf("[recomp] Loaded segment %s (%llu bytes) at 0x%llx\n",name,
+         (unsigned long long)expected_size,(unsigned long long)vaddr);
+  return 1;
+}
+
+int recomp_load_segments(GuestContext* c,const char* data_dir,
+                         uint64_t text_vaddr,uint64_t text_size,
+                         uint64_t rodata_vaddr,uint64_t rodata_size,
+                         uint64_t data_vaddr,uint64_t data_size,uint64_t bss_size){
+  uint8_t* bss;
+  if(!load_segment(c,data_dir,"text.bin",text_vaddr,text_size) ||
+     !load_segment(c,data_dir,"rodata.bin",rodata_vaddr,rodata_size) ||
+     !load_segment(c,data_dir,"data.bin",data_vaddr,data_size)) return 0;
+  if(data_size>~(uint64_t)0-data_vaddr){
+    fprintf(stderr,"[recomp] Data/BSS address overflow\n"); return 0;
+  }
+  if(bss_size>(uint64_t)(size_t)-1){
+    fprintf(stderr,"[recomp] BSS is too large for this host\n"); return 0;
+  }
+  bss=memptr(c,data_vaddr+data_size,bss_size);
+  if(bss_size!=0 && !bss){
+    fprintf(stderr,"[recomp] BSS lies outside guest memory\n"); return 0;
+  }
+  if(bss_size!=0) memset(bss,0,(size_t)bss_size);
   return 1;
 }
 

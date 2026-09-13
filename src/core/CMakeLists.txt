@@ -19,6 +19,8 @@ add_library(core STATIC
     constants.h
     recompiler/nso_image.cpp
     recompiler/nso_image.h
+    recompiler/npdm_info.cpp
+    recompiler/npdm_info.h
     core.cpp
     core.h
     libretro_wrapper.cpp

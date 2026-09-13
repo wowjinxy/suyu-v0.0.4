@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/recompiler/arm64_to_c.h"
+#include "core/recompiler/npdm_info.h"
 #include "core/recompiler/nso_image.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #ifdef SUYU_RECOMPILER_HAS_LZ4
@@ -40,12 +43,14 @@ using suyu::recomp::u8;
 
 enum class Command {
     EmitRaw,
+    EmitNso,
     InspectNso,
 };
 
 struct Options {
     Command command{Command::EmitRaw};
     std::filesystem::path text_path;
+    std::filesystem::path npdm_path;
     std::filesystem::path output_path;
     std::string module = "main";
     std::string title;
@@ -55,33 +60,47 @@ struct Options {
     bool force = false;
     bool json = false;
     bool assume_aarch64 = false;
+    bool have_npdm = false;
 };
 
 void PrintUsage(std::ostream& out, std::string_view executable) {
     out << "suyu-recomp - experimental AArch64 static recompiler\n\n"
         << "Usage:\n"
         << "  " << executable
-        << " emit-raw --input <text.bin> --base <address> --output <directory> [options]\n"
-        << "  " << executable << " inspect-nso --input <module.nso> [--json] [--assume-aarch64]\n"
+        << " emit-raw --input <text.bin> --base <address> --output <directory> "
+           "[options]\n"
+        << "  " << executable
+        << " emit-nso --input <module.nso> --npdm <main.npdm> --output "
+           "<directory> [options]\n"
+        << "  " << executable << " inspect-nso --input <module.nso> [--npdm <main.npdm>] [--json]\n"
         << "  " << executable
         << " <text.bin> <address> <directory> [--source-only]  (legacy form)\n\n"
-        << "Required:\n"
-        << "  --input <path>       Raw, little-endian AArch64 .text bytes\n"
-        << "  --base <address>     Guest virtual address, decimal or 0x-prefixed hex\n"
-        << "  --output <path>      Directory for the generated CMake project\n\n"
-        << "Options:\n"
-        << "  --entry <address>    Initial guest PC (defaults to --base)\n"
-        << "  --root <address>     Additional block-discovery root; may be repeated\n"
+        << "Arguments:\n"
+        << "  --input <path>       Raw .text for emit-raw, or a plaintext NSO\n"
+        << "  --base <address>     emit-raw guest address, decimal or "
+           "0x-prefixed hex\n"
+        << "  --output <path>      Directory for an emitted CMake project\n"
+        << "  --entry <address>    emit-raw initial guest PC (defaults to "
+           "--base)\n"
+        << "  --root <address>     emit-raw block-discovery root; may be "
+           "repeated\n"
         << "  --module <name>      C identifier fragment (defaults to main)\n"
-        << "  --title <text>       Display title embedded in the standalone runner\n"
-        << "  --force              Allow writing into a non-empty output directory\n"
+        << "  --title <text>       Display title embedded in the standalone "
+           "runner\n"
+        << "  --force              Allow writing into a non-empty output "
+           "directory\n"
         << "  --json               Emit machine-readable inspect-nso output\n"
-        << "  --assume-aarch64     Analyze decoded text as AArch64 (NSO has no ISA field)\n"
+        << "  --npdm <path>        Read architecture from a structurally "
+           "validated main.npdm\n"
+        << "  --assume-aarch64     Explicitly bypass NPDM architecture "
+           "detection\n"
         << "  -h, --help           Show this help\n\n"
-        << "inspect-nso accepts a plaintext NSO and never needs title keys. Recompilation\n"
-        << "still requires an architecture decision from main.npdm or an explicit assumption.\n"
+        << "Commands accept plaintext NSO/NPDM files and never need title keys. "
+           "emit-nso\n"
+        << "requires main.npdm or an explicit --assume-aarch64 override.\n"
         << "Generated standalone programs use\n"
-        << "stub services; real games require the hosted suyu ArmRecomp runtime.\n";
+        << "stub services; real games require the hosted suyu ArmRecomp "
+           "runtime.\n";
 }
 
 bool IsOption(std::string_view value) {
@@ -166,7 +185,8 @@ std::optional<std::vector<std::string>> GetUtf8Arguments() {
 #endif
 
 std::optional<std::vector<u8>> ReadFile(const std::filesystem::path& path,
-                                        std::string_view description) {
+                                        std::string_view description,
+                                        std::optional<std::uintmax_t> maximum_size = std::nullopt) {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) {
         std::cerr << "error: cannot open " << description << ": " << PathToUtf8(path) << '\n';
@@ -180,13 +200,25 @@ std::optional<std::vector<u8>> ReadFile(const std::filesystem::path& path,
         return std::nullopt;
     }
     const auto size = static_cast<std::uintmax_t>(end);
+    if (maximum_size && size > *maximum_size) {
+        std::cerr << "error: " << description << " exceeds maximum size of " << *maximum_size
+                  << " bytes: " << PathToUtf8(path) << '\n';
+        return std::nullopt;
+    }
     if (size > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max()) ||
         size > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
         std::cerr << "error: " << description << " is too large for this host\n";
         return std::nullopt;
     }
 
-    std::vector<u8> bytes(static_cast<std::size_t>(size));
+    std::vector<u8> bytes;
+    try {
+        bytes.resize(static_cast<std::size_t>(size));
+    } catch (const std::exception& error) {
+        std::cerr << "error: could not allocate space for " << description << ": " << error.what()
+                  << '\n';
+        return std::nullopt;
+    }
     stream.seekg(0);
     if (!bytes.empty() && !stream.read(reinterpret_cast<char*>(bytes.data()),
                                        static_cast<std::streamsize>(bytes.size()))) {
@@ -204,12 +236,15 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
     bool have_output = false;
 
     const bool emit_raw_command = argc > 1 && std::string_view{argv[1]} == "emit-raw";
+    const bool emit_nso_command = argc > 1 && std::string_view{argv[1]} == "emit-nso";
     const bool inspect_nso_command = argc > 1 && std::string_view{argv[1]} == "inspect-nso";
-    if (inspect_nso_command) {
+    if (emit_nso_command) {
+        options.command = Command::EmitNso;
+    } else if (inspect_nso_command) {
         options.command = Command::InspectNso;
     }
-    if (!emit_raw_command && !inspect_nso_command && argc >= 4 && !IsOption(argv[1]) &&
-        !IsOption(argv[2]) && !IsOption(argv[3])) {
+    if (!emit_raw_command && !emit_nso_command && !inspect_nso_command && argc >= 4 &&
+        !IsOption(argv[1]) && !IsOption(argv[2]) && !IsOption(argv[3])) {
         options.text_path = suyu::recomp::Utf8Path(argv[1]);
         const auto base = ParseAddress(argv[2]);
         if (!base) {
@@ -221,7 +256,8 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
         have_input = have_base = have_output = true;
     }
 
-    const int start = have_input ? 4 : ((emit_raw_command || inspect_nso_command) ? 2 : 1);
+    const int start =
+        have_input ? 4 : ((emit_raw_command || emit_nso_command || inspect_nso_command) ? 2 : 1);
     for (int i = start; i < argc; ++i) {
         const std::string_view argument = argv[i];
         const auto value_after = [&](std::string_view option) -> std::optional<std::string_view> {
@@ -240,8 +276,12 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             std::exit(0);
         }
         if (argument == "--source-only") {
-            // Kept for compatibility with the original positional CLI. EmitProject only emits
-            // source and has never invoked a compiler itself.
+            if (options.command != Command::EmitRaw) {
+                std::cerr << "error: --source-only is only valid for emit-raw\n";
+                return std::nullopt;
+            }
+            // Kept for compatibility with the original positional CLI. EmitProject
+            // only emits source and has never invoked a compiler itself.
             continue;
         }
         if (argument == "--force") {
@@ -261,8 +301,8 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             continue;
         }
         if (argument == "--assume-aarch64") {
-            if (options.command != Command::InspectNso) {
-                std::cerr << "error: --assume-aarch64 is only valid for inspect-nso\n";
+            if (options.command == Command::EmitRaw) {
+                std::cerr << "error: --assume-aarch64 is only valid for NSO commands\n";
                 return std::nullopt;
             }
             options.assume_aarch64 = true;
@@ -276,12 +316,24 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             have_input = true;
             continue;
         }
-        if (options.command == Command::InspectNso) {
-            std::cerr << "error: unknown inspect-nso argument: " << argument << '\n';
-            return std::nullopt;
+        if (const auto value = value_after("--npdm")) {
+            if (value->empty()) {
+                return std::nullopt;
+            }
+            if (options.command == Command::EmitRaw) {
+                std::cerr << "error: --npdm is only valid for NSO commands\n";
+                return std::nullopt;
+            }
+            options.npdm_path = suyu::recomp::Utf8Path(std::string{*value});
+            options.have_npdm = true;
+            continue;
         }
         if (const auto value = value_after("--base")) {
             if (value->empty()) {
+                return std::nullopt;
+            }
+            if (options.command != Command::EmitRaw) {
+                std::cerr << "error: --base is only valid for emit-raw\n";
                 return std::nullopt;
             }
             const auto address = ParseAddress(*value);
@@ -297,12 +349,20 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             if (value->empty()) {
                 return std::nullopt;
             }
+            if (options.command == Command::InspectNso) {
+                std::cerr << "error: --output is not valid for inspect-nso\n";
+                return std::nullopt;
+            }
             options.output_path = suyu::recomp::Utf8Path(std::string{*value});
             have_output = true;
             continue;
         }
         if (const auto value = value_after("--entry")) {
             if (value->empty()) {
+                return std::nullopt;
+            }
+            if (options.command != Command::EmitRaw) {
+                std::cerr << "error: --entry is only valid for emit-raw\n";
                 return std::nullopt;
             }
             options.entry = ParseAddress(*value);
@@ -314,6 +374,10 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
         }
         if (const auto value = value_after("--root")) {
             if (value->empty()) {
+                return std::nullopt;
+            }
+            if (options.command != Command::EmitRaw) {
+                std::cerr << "error: --root is only valid for emit-raw\n";
                 return std::nullopt;
             }
             const auto address = ParseAddress(*value);
@@ -328,11 +392,19 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             if (value->empty()) {
                 return std::nullopt;
             }
+            if (options.command == Command::InspectNso) {
+                std::cerr << "error: --module is not valid for inspect-nso\n";
+                return std::nullopt;
+            }
             options.module = *value;
             continue;
         }
         if (const auto value = value_after("--title")) {
             if (value->empty()) {
+                return std::nullopt;
+            }
+            if (options.command == Command::InspectNso) {
+                std::cerr << "error: --title is not valid for inspect-nso\n";
                 return std::nullopt;
             }
             options.title = *value;
@@ -347,6 +419,28 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             std::cerr << "error: inspect-nso requires --input\n";
             return std::nullopt;
         }
+        if (options.have_npdm && options.assume_aarch64) {
+            std::cerr << "error: choose either --npdm or --assume-aarch64, not both\n";
+            return std::nullopt;
+        }
+        return options;
+    }
+
+    if (options.command == Command::EmitNso) {
+        if (!have_input || !have_output) {
+            std::cerr << "error: emit-nso requires --input and --output\n";
+            return std::nullopt;
+        }
+        if (options.have_npdm == options.assume_aarch64) {
+            std::cerr << "error: emit-nso requires exactly one of --npdm or "
+                         "--assume-aarch64\n";
+            return std::nullopt;
+        }
+        if (!IsModuleName(options.module)) {
+            std::cerr << "error: --module must contain 1-32 ASCII letters, digits, "
+                         "or underscores\n";
+            return std::nullopt;
+        }
         return options;
     }
 
@@ -355,7 +449,8 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
         return std::nullopt;
     }
     if (!IsModuleName(options.module)) {
-        std::cerr << "error: --module must contain 1-32 ASCII letters, digits, or underscores\n";
+        std::cerr << "error: --module must contain 1-32 ASCII letters, digits, or "
+                     "underscores\n";
         return std::nullopt;
     }
     if ((options.base & 3) != 0) {
@@ -430,6 +525,92 @@ bool DecompressLz4(std::span<const std::uint8_t> source, std::span<std::uint8_t>
 }
 #endif
 
+struct LoadedNpdm {
+    suyu::recomp::NpdmInfo info;
+    std::vector<std::string> warnings;
+};
+
+std::optional<LoadedNpdm> LoadNpdm(const std::filesystem::path& path) {
+    const auto bytes = ReadFile(path, "main.npdm", suyu::recomp::MaximumNpdmSize);
+    if (!bytes) {
+        return std::nullopt;
+    }
+    auto inspection = suyu::recomp::InspectNpdm(*bytes);
+    if (!inspection) {
+        std::cerr << "error: invalid main.npdm: " << inspection.error << '\n';
+        return std::nullopt;
+    }
+    return LoadedNpdm{std::move(*inspection.info), std::move(inspection.warnings)};
+}
+
+bool ValidateOutputDirectory(const Options& options) {
+    std::error_code error;
+    const bool exists = std::filesystem::exists(options.output_path, error);
+    if (error) {
+        std::cerr << "error: cannot inspect output path: " << error.message() << '\n';
+        return false;
+    }
+    bool has_entries = false;
+    if (exists) {
+        const bool is_directory = std::filesystem::is_directory(options.output_path, error);
+        if (error) {
+            std::cerr << "error: cannot inspect output path: " << error.message() << '\n';
+            return false;
+        }
+        if (!is_directory) {
+            std::cerr << "error: output path exists and is not a directory: "
+                      << PathToUtf8(options.output_path) << '\n';
+            return false;
+        }
+        const std::filesystem::directory_iterator first(options.output_path, error);
+        if (error) {
+            std::cerr << "error: cannot inspect output directory: " << error.message() << '\n';
+            return false;
+        }
+        has_entries = first != std::filesystem::directory_iterator{};
+    }
+    if (has_entries && !options.force) {
+        std::cerr << "error: output directory is not empty; pass --force to "
+                     "overwrite the "
+                     "generated files\n";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateGeneratedProject(const Options& options, bool expect_rodata, bool expect_data) {
+    std::vector<std::filesystem::path> required_files{
+        "CMakeLists.txt",
+        "main.c",
+        "recomp_export.c",
+        "recomp_runtime.c",
+        "recomp_runtime.h",
+        "data/text.bin",
+        std::filesystem::path{"src"} / ("recompiled_" + options.module + ".c"),
+        std::filesystem::path{"src"} / ("recompiled_" + options.module + "_0.c"),
+    };
+    if (expect_rodata) {
+        required_files.emplace_back("data/rodata.bin");
+    }
+    if (expect_data) {
+        required_files.emplace_back("data/data.bin");
+    }
+    for (const auto& relative_path : required_files) {
+        const std::filesystem::path generated_path = options.output_path / relative_path;
+        if (!std::filesystem::is_regular_file(generated_path)) {
+            std::cerr << "error: generation did not produce " << PathToUtf8(generated_path) << '\n';
+            return false;
+        }
+    }
+    return true;
+}
+
+void PrintGenerationResult(const Options& options, const suyu::recomp::RecompileStats& stats) {
+    std::cout << "Generated " << stats.blocks << " blocks from " << stats.instructions
+              << " AArch64 instructions (" << stats.translated_terminators
+              << " translated terminators).\nOutput: " << PathToUtf8(options.output_path) << '\n';
+}
+
 int InspectNso(const Options& options) {
     const auto bytes = ReadFile(options.text_path, "NSO image");
     if (!bytes) {
@@ -442,6 +623,13 @@ int InspectNso(const Options& options) {
         return 1;
     }
     const auto& info = *inspection.info;
+    std::optional<LoadedNpdm> npdm;
+    if (options.have_npdm) {
+        npdm = LoadNpdm(options.npdm_path);
+        if (!npdm) {
+            return 1;
+        }
+    }
 
 #ifdef SUYU_RECOMPILER_HAS_LZ4
     const auto decoded = suyu::recomp::DecodeNso(*bytes, DecompressLz4);
@@ -464,12 +652,18 @@ int InspectNso(const Options& options) {
         std::cerr << "error: NSO segment decoding failed: " << decoded.error << '\n';
         return 1;
     }
-    const auto& warnings = decoded.warnings;
+    std::vector<std::string> warnings = decoded.warnings;
+    if (npdm) {
+        warnings.insert(warnings.end(), npdm->warnings.begin(), npdm->warnings.end());
+    }
 
     std::optional<u64> aarch64_entry;
     std::vector<suyu::recomp::Block> aarch64_blocks;
     std::string aarch64_error;
-    if (options.assume_aarch64) {
+    const bool analyze_aarch64 =
+        options.assume_aarch64 ||
+        (npdm && npdm->info.architecture == suyu::recomp::NpdmArchitecture::Aarch64);
+    if (analyze_aarch64) {
         if (!decoded) {
             aarch64_error = decoded.error;
         } else {
@@ -478,9 +672,15 @@ int InspectNso(const Options& options) {
             if (text.empty() || (text.size() & 3) != 0 || (base & 3) != 0) {
                 aarch64_error = "text must be non-empty, four-byte aligned, and word-sized";
             } else {
-                aarch64_entry = base + suyu::recomp::FindNsoAarch64EntryOffset(text);
-                aarch64_blocks = suyu::recomp::DiscoverBlocks(text.data(), text.size(), base,
-                                                              *aarch64_entry, nullptr);
+                const std::uint32_t entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(text);
+                if (entry_offset == 0) {
+                    aarch64_error =
+                        "could not validate the conventional AArch64 entry stub and MOD0 header";
+                } else {
+                    aarch64_entry = base + entry_offset;
+                    aarch64_blocks = suyu::recomp::DiscoverBlocks(text.data(), text.size(), base,
+                                                                  *aarch64_entry, nullptr);
+                }
             }
         }
     }
@@ -493,9 +693,19 @@ int InspectNso(const Options& options) {
                   << "Flags: " << Hex(info.flags) << '\n'
                   << "Architecture: "
                   << (options.assume_aarch64 ? "AArch64 (explicit assumption)"
+                      : npdm                 ? std::string{suyu::recomp::NpdmArchitectureName(
+                                                   npdm->info.architecture)} +
+                                                   " (main.npdm)"
                                              : "unknown (main.npdm required)")
-                  << '\n'
-                  << "Build ID: " << build_id << '\n'
+                  << '\n';
+        if (npdm) {
+            std::cout << "NPDM address space: "
+                      << (npdm->info.address_space
+                              ? suyu::recomp::NpdmAddressSpaceName(*npdm->info.address_space)
+                              : "unknown")
+                      << '\n';
+        }
+        std::cout << "Build ID: " << build_id << '\n'
                   << "Execute-only text: " << (info.execute_only ? "yes" : "no") << '\n'
                   << "Segments:\n";
         for (std::size_t i = 0; i < info.segments.size(); ++i) {
@@ -528,7 +738,7 @@ int InspectNso(const Options& options) {
             std::cout << "Segments decoded: no (" << decoded.error << ")\n";
             std::cout << "Required hashes verified: unavailable\n";
         }
-        if (options.assume_aarch64) {
+        if (analyze_aarch64) {
             if (aarch64_error.empty()) {
                 std::cout << "AArch64 entry: " << Hex(*aarch64_entry) << '\n'
                           << "AArch64 blocks: " << aarch64_blocks.size() << '\n'
@@ -544,12 +754,24 @@ int InspectNso(const Options& options) {
         return 0;
     }
 
+    const char* architecture_json = "null";
+    if (options.assume_aarch64) {
+        architecture_json = "\"aarch64-assumed\"";
+    } else if (npdm) {
+        architecture_json = npdm->info.architecture == suyu::recomp::NpdmArchitecture::Aarch64
+                                ? "\"aarch64\""
+                                : "\"aarch32\"";
+    }
     std::cout << "{\n"
               << "  \"format\": \"NSO0\",\n"
               << "  \"input\": \"" << JsonEscape(PathToUtf8(options.text_path)) << "\",\n"
               << "  \"version\": " << info.version << ",\n"
               << "  \"flags\": \"" << Hex(info.flags) << "\",\n"
-              << "  \"architecture\": " << (options.assume_aarch64 ? "\"aarch64-assumed\"" : "null")
+              << "  \"architecture\": " << architecture_json << ",\n"
+              << "  \"architecture_source\": "
+              << (options.assume_aarch64 ? "\"assumption\""
+                  : npdm                 ? "\"npdm\""
+                                         : "null")
               << ",\n"
               << "  \"build_id\": \"" << build_id << "\",\n"
               << "  \"execute_only\": " << (info.execute_only ? "true" : "false") << ",\n"
@@ -594,7 +816,7 @@ int InspectNso(const Options& options) {
         std::cout << "\"" << JsonEscape(decoded.error) << "\",\n";
     }
     std::cout << "  \"aarch64_analysis\": ";
-    if (!options.assume_aarch64) {
+    if (!analyze_aarch64) {
         std::cout << "null,\n";
     } else if (!aarch64_error.empty()) {
         std::cout << "{\"error\": \"" << JsonEscape(aarch64_error) << "\"},\n";
@@ -608,6 +830,99 @@ int InspectNso(const Options& options) {
         std::cout << (i == 0 ? "" : ", ") << "\"" << JsonEscape(warnings[i]) << "\"";
     }
     std::cout << "]\n}\n";
+    return 0;
+}
+
+int EmitNso(const Options& options) {
+    std::optional<LoadedNpdm> npdm;
+    if (options.have_npdm) {
+        npdm = LoadNpdm(options.npdm_path);
+        if (!npdm) {
+            return 1;
+        }
+        if (!npdm->info.address_space) {
+            std::cerr << "error: main.npdm uses an unsupported process address-space "
+                         "value\n";
+            return 1;
+        }
+        if (npdm->info.architecture != suyu::recomp::NpdmArchitecture::Aarch64) {
+            std::cerr << "error: main.npdm declares AArch32; emit-nso currently "
+                         "supports only "
+                         "AArch64\n";
+            return 1;
+        }
+    } else {
+        std::cerr << "warning: treating NSO instructions as AArch64 without main.npdm\n";
+    }
+
+    const auto bytes = ReadFile(options.text_path, "NSO image");
+    if (!bytes) {
+        return 1;
+    }
+#ifdef SUYU_RECOMPILER_HAS_LZ4
+    auto decoded = suyu::recomp::DecodeNso(*bytes, DecompressLz4);
+#else
+    auto decoded = suyu::recomp::DecodeNso(*bytes);
+#endif
+    if (!decoded) {
+        std::cerr << "error: NSO segment decoding failed: " << decoded.error << '\n';
+        return 1;
+    }
+
+    const auto& info = decoded.image->info;
+    const std::string layout_error = suyu::recomp::ValidateNsoExecutableLayout(info);
+    if (!layout_error.empty()) {
+        std::cerr << "error: NSO executable layout is invalid: " << layout_error << '\n';
+        return 1;
+    }
+    const auto& text = decoded.image->segments[0];
+    const auto& rodata = decoded.image->segments[1];
+    const auto& data = decoded.image->segments[2];
+    const u64 base = info.segments[0].memory_offset;
+    if (text.empty() || (text.size() & 3) != 0 || (base & 3) != 0) {
+        std::cerr << "error: decoded NSO text must be non-empty, word-sized, and "
+                     "aligned\n";
+        return 1;
+    }
+    const std::uint32_t entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(text);
+    if (entry_offset == 0) {
+        std::cerr << "error: could not validate the conventional AArch64 NSO entry "
+                     "stub and MOD0 "
+                     "header\n";
+        return 1;
+    }
+    const u64 entry = base + entry_offset;
+    if (!ValidateOutputDirectory(options)) {
+        return 1;
+    }
+
+    try {
+        const auto stats = suyu::recomp::EmitProject(
+            options.module, text.data(), text.size(), base, PathToUtf8(options.output_path), true,
+            rodata.empty() ? nullptr : rodata.data(), rodata.size(),
+            data.empty() ? nullptr : data.data(), data.size(), entry, options.title, nullptr,
+            suyu::recomp::RecompileImageLayout{info.segments[1].memory_offset,
+                                               info.segments[2].memory_offset, info.bss_size});
+        if (!ValidateGeneratedProject(options, !rodata.empty(), !data.empty())) {
+            return 1;
+        }
+        PrintGenerationResult(options, stats);
+        std::cout << "NSO build ID: " << suyu::recomp::NsoBuildIdToHex(info.build_id) << '\n'
+                  << "Architecture: AArch64 (" << (npdm ? "main.npdm" : "explicit assumption")
+                  << ")\n"
+                  << "Entry: " << Hex(entry) << '\n';
+        for (const std::string& warning : decoded.warnings) {
+            std::cerr << "warning: " << warning << '\n';
+        }
+        if (npdm) {
+            for (const std::string& warning : npdm->warnings) {
+                std::cerr << "warning: " << warning << '\n';
+            }
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "error: generation failed: " << error.what() << '\n';
+        return 1;
+    }
     return 0;
 }
 
@@ -627,13 +942,17 @@ int Run(int argc, char** argv) {
     if (options.command == Command::InspectNso) {
         return InspectNso(options);
     }
+    if (options.command == Command::EmitNso) {
+        return EmitNso(options);
+    }
 
     const auto text = ReadFile(options.text_path, "text segment");
     if (!text) {
         return 1;
     }
     if (text->empty() || (text->size() & 3) != 0) {
-        std::cerr << "error: the text segment must be non-empty and a multiple of four bytes\n";
+        std::cerr << "error: the text segment must be non-empty and a multiple of "
+                     "four bytes\n";
         return 1;
     }
     if (text->size() > std::numeric_limits<u64>::max() - options.base) {
@@ -649,7 +968,8 @@ int Run(int argc, char** argv) {
 
     for (const u64 root : options.extra_roots) {
         if ((root & 3) != 0 || root < options.base || root >= options.base + text->size()) {
-            std::cerr << "error: every --root must be aligned and inside the text segment\n";
+            std::cerr << "error: every --root must be aligned and inside the text "
+                         "segment\n";
             return 1;
         }
     }
@@ -682,7 +1002,8 @@ int Run(int argc, char** argv) {
         output_has_entries = first != std::filesystem::directory_iterator{};
     }
     if (output_has_entries && !options.force) {
-        std::cerr << "error: output directory is not empty; pass --force to overwrite the "
+        std::cerr << "error: output directory is not empty; pass --force to "
+                     "overwrite the "
                      "generated files\n";
         return 1;
     }

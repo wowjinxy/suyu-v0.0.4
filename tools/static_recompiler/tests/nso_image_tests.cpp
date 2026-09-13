@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/recompiler/npdm_info.h"
 #include "core/recompiler/nso_image.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,8 +31,9 @@ std::vector<Byte> MakeNso() {
     std::vector<Byte> bytes(0x120);
     std::copy_n(reinterpret_cast<const Byte*>("NSO0"), 4, bytes.begin());
 
-    // Three adjacent, uncompressed segments. Deliberately put nonsense in the compressed-size
-    // fields: the format says those fields are only authoritative when the matching flag is set.
+    // Three adjacent, uncompressed segments. Deliberately put nonsense in the
+    // compressed-size fields: the format says those fields are only authoritative
+    // when the matching flag is set.
     PutU32(bytes, 0x10, 0x100);
     PutU32(bytes, 0x14, 0x1000);
     PutU32(bytes, 0x18, 0x10);
@@ -75,6 +79,74 @@ std::vector<Byte> MakeLz4Nso() {
     return bytes;
 }
 
+std::vector<Byte> MakeEmittableNso() {
+    constexpr std::size_t TextSize = 0x68;
+    std::vector<Byte> bytes(0x178);
+    std::copy_n(reinterpret_cast<const Byte*>("NSO0"), 4, bytes.begin());
+    PutU32(bytes, 0x10, 0x100);
+    PutU32(bytes, 0x14, 0x1000);
+    PutU32(bytes, 0x18, TextSize);
+    PutU32(bytes, 0x20, 0x168);
+    PutU32(bytes, 0x24, 0x3000);
+    PutU32(bytes, 0x28, 8);
+    PutU32(bytes, 0x30, 0x170);
+    PutU32(bytes, 0x34, 0x5000);
+    PutU32(bytes, 0x38, 8);
+    PutU32(bytes, 0x3C, 0x10);
+    for (std::size_t i = 0; i < 0x20; ++i) {
+        bytes[0x40 + i] = static_cast<Byte>(0x80 + i);
+    }
+
+    // A conventional NSO entry stub and a minimum-sized MOD0 header.
+    PutU32(bytes, 0x100, 0x14000010); // b text+0x40
+    PutU32(bytes, 0x104, 8);
+    std::copy_n(reinterpret_cast<const Byte*>("MOD0"), 4, bytes.begin() + 0x108);
+
+    // Load 5 from rodata and 7 from data, add them, then prove that the zeroed
+    // BSS tail is mapped by storing and reloading 9 at data+8. The standalone SVC
+    // diagnostic prints x0-x3.
+    constexpr std::array<std::uint32_t, 10> EntryInstructions{
+        0xD0000000, // adrp x0, rodata@0x3000
+        0xF9400000, // ldr  x0, [x0]
+        0x90000021, // adrp x1, data@0x5000
+        0xF9400021, // ldr  x1, [x1]
+        0x8B010002, // add  x2, x0, x1
+        0x90000023, // adrp x3, data@0x5000
+        0xD2800124, // mov  x4, #9
+        0xF9000464, // str  x4, [x3, #8] (BSS)
+        0xF9400463, // ldr  x3, [x3, #8]
+        0xD4000001, // svc  #0
+    };
+    for (std::size_t i = 0; i < EntryInstructions.size(); ++i) {
+        PutU32(bytes, 0x140 + i * 4, EntryInstructions[i]);
+    }
+    bytes[0x168] = 5;
+    bytes[0x170] = 7;
+    return bytes;
+}
+
+std::vector<Byte> MakeNpdm(bool aarch64, std::uint8_t address_space = 3) {
+    std::vector<Byte> bytes(0x300);
+    std::copy_n(reinterpret_cast<const Byte*>("META"), 4, bytes.begin());
+    bytes[0x0C] = static_cast<Byte>((aarch64 ? 1 : 0) | (address_space << 1));
+    bytes[0x0E] = 0x2C;
+    PutU32(bytes, 0x1C, 0x100000);
+    PutU32(bytes, 0x70, 0x2C0);
+    PutU32(bytes, 0x74, 0x40);
+    PutU32(bytes, 0x78, 0x80);
+    PutU32(bytes, 0x7C, 0x240);
+
+    std::copy_n(reinterpret_cast<const Byte*>("ACID"), 4, bytes.begin() + 0x280);
+    for (const std::size_t offset : {0x2A0, 0x2A8, 0x2B0}) {
+        PutU32(bytes, offset, 0x240);
+    }
+    std::copy_n(reinterpret_cast<const Byte*>("ACI0"), 4, bytes.begin() + 0x2C0);
+    for (const std::size_t offset : {0x2E0, 0x2E8, 0x2F0}) {
+        PutU32(bytes, offset, 0x40);
+    }
+    return bytes;
+}
+
 bool IdentityDecompress(std::span<const Byte> source, std::span<Byte> destination) {
     if (source.size() != destination.size()) {
         return false;
@@ -98,8 +170,11 @@ void RunTests() {
     Check(static_cast<bool>(inspection), "valid NSO inspects successfully");
     if (inspection) {
         const auto& info = *inspection.info;
+        Check(suyu::recomp::ValidateNsoExecutableLayout(info).empty(),
+              "valid NSO has an executable load layout");
         Check(info.segments[0].stored_size == 0x10,
-              "uncompressed text uses decoded size rather than compressed-size field");
+              "uncompressed text uses decoded size rather than compressed-size "
+              "field");
         Check(info.segments[1].stored_size == 0x08, "rodata stored size is decoded size");
         Check(info.bss_size == 0x20, "data extra word is exposed as BSS size");
         Check(suyu::recomp::NsoBuildIdToHex(info.build_id) ==
@@ -131,6 +206,21 @@ void RunTests() {
     auto memory_overlap = valid;
     PutU32(memory_overlap, 0x24, 0x1008);
     Check(!suyu::recomp::InspectNso(memory_overlap), "overlapping memory segments are rejected");
+
+    auto misaligned_layout = valid;
+    PutU32(misaligned_layout, 0x14, 0x1004);
+    const auto misaligned_inspection = suyu::recomp::InspectNso(misaligned_layout);
+    Check(misaligned_inspection &&
+              !suyu::recomp::ValidateNsoExecutableLayout(*misaligned_inspection.info).empty(),
+          "executable layout rejects a non-page-aligned destination");
+
+    auto reversed_layout = valid;
+    PutU32(reversed_layout, 0x24, 0x4000);
+    PutU32(reversed_layout, 0x34, 0x3000);
+    const auto reversed_inspection = suyu::recomp::InspectNso(reversed_layout);
+    Check(reversed_inspection &&
+              !suyu::recomp::ValidateNsoExecutableLayout(*reversed_inspection.info).empty(),
+          "executable layout rejects reversed rodata and data destinations");
 
     auto bad_extent = valid;
     PutU32(bad_extent, 0x88, 8);
@@ -212,9 +302,13 @@ void RunTests() {
     fake_mod0[11] = '0';
     Check(suyu::recomp::FindNsoAarch64EntryOffset(fake_mod0) == 0x24,
           "entry probe accepts a bounded MOD0 header and AArch64 branch stub");
+    PutU32(fake_mod0, 0, 0x14000002); // b text+8, into MOD0 metadata
+    Check(suyu::recomp::FindNsoAarch64EntryOffset(fake_mod0) == 0,
+          "entry probe rejects a branch into the MOD0 header");
 
-    // HOS 19+ extends MOD0 from 0x1c to 0x34 bytes. Nonzero extension fields must not be mistaken
-    // for code; the entry-stub branch is the authoritative target.
+    // HOS 19+ extends MOD0 from 0x1c to 0x34 bytes. Nonzero extension fields must
+    // not be mistaken for code; the entry-stub branch is the authoritative
+    // target.
     PutU32(fake_mod0, 0, 0x1400000F); // b +0x3c
     for (std::size_t offset = 0x24; offset < 0x3C; offset += 4) {
         PutU32(fake_mod0, offset, static_cast<std::uint32_t>(offset));
@@ -247,10 +341,70 @@ void RunTests() {
                                         return warning.find("not verified") != std::string::npos;
                                     }),
           "hash-required image emits an integrity warning");
+
+    const std::vector<Byte> npdm64 = MakeNpdm(true);
+    const auto npdm64_result = suyu::recomp::InspectNpdm(npdm64);
+    Check(static_cast<bool>(npdm64_result), "valid AArch64 NPDM inspects successfully");
+    if (npdm64_result) {
+        Check(npdm64_result.info->architecture == suyu::recomp::NpdmArchitecture::Aarch64,
+              "NPDM bit zero selects AArch64");
+        Check(npdm64_result.info->address_space ==
+                  suyu::recomp::NpdmAddressSpace::AddressSpace64Bit,
+              "NPDM address-space bits are decoded independently");
+    }
+    const auto npdm32_result = suyu::recomp::InspectNpdm(MakeNpdm(false, 2));
+    Check(npdm32_result &&
+              npdm32_result.info->architecture == suyu::recomp::NpdmArchitecture::Aarch32,
+          "NPDM bit zero selects AArch32");
+
+    auto modern_flags = npdm64;
+    modern_flags[0x0C] |= 0xF0;
+    Check(static_cast<bool>(suyu::recomp::InspectNpdm(modern_flags)),
+          "modern NPDM feature flags are accepted");
+    const auto unknown_address_space = suyu::recomp::InspectNpdm(MakeNpdm(true, 4));
+    Check(unknown_address_space && !unknown_address_space.info->address_space,
+          "unknown NPDM address spaces remain explicit");
+
+    auto bad_npdm = npdm64;
+    bad_npdm[0] = 'X';
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "bad META magic is rejected");
+    Check(!suyu::recomp::InspectNpdm(std::span<const Byte>{npdm64}.first(0x80)),
+          "META-only file cannot supply a trusted architecture");
+    bad_npdm = npdm64;
+    bad_npdm[0x2C0] = 'X';
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "bad ACI0 magic is rejected");
+    bad_npdm = npdm64;
+    bad_npdm[0x280] = 'X';
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "bad ACID magic is rejected");
+    bad_npdm = npdm64;
+    PutU32(bad_npdm, 0x70, 0x40);
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "ACI0 may not overlap META");
+    bad_npdm = npdm64;
+    PutU32(bad_npdm, 0x74, 0x20);
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "undersized ACI0 is rejected");
+    bad_npdm = npdm64;
+    PutU32(bad_npdm, 0x70, 0x100);
+    std::copy_n(reinterpret_cast<const Byte*>("ACI0"), 4, bad_npdm.begin() + 0x100);
+    for (const std::size_t offset : {0x120, 0x128, 0x130}) {
+        PutU32(bad_npdm, offset, 0x40);
+    }
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "overlapping ACI0 and ACID are rejected");
+    bad_npdm = npdm64;
+    PutU32(bad_npdm, 0x78, 0xFFFFFFFF);
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "overflowing ACID range is rejected");
+    bad_npdm = npdm64;
+    PutU32(bad_npdm, 0x2A0, 0x23F);
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "ACID child before its header is rejected");
+    bad_npdm = npdm64;
+    PutU32(bad_npdm, 0x2E0, 0x40);
+    PutU32(bad_npdm, 0x2E4, 1);
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "ACI0 child beyond its region is rejected");
+    bad_npdm = npdm64;
+    bad_npdm.resize(suyu::recomp::MaximumNpdmSize + 1);
+    Check(!suyu::recomp::InspectNpdm(bad_npdm), "oversized NPDM input is rejected");
 }
 
-bool WriteFixture(const std::filesystem::path& path, bool compressed) {
-    const std::vector<Byte> bytes = compressed ? MakeLz4Nso() : MakeNso();
+bool WriteBytes(const std::filesystem::path& path, const std::vector<Byte>& bytes) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     return output &&
            output.write(reinterpret_cast<const char*>(bytes.data()),
@@ -261,13 +415,40 @@ bool WriteFixture(const std::filesystem::path& path, bool compressed) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && (std::string_view{argv[1]} == "--write-fixture" ||
-                      std::string_view{argv[1]} == "--write-lz4-fixture")) {
+    if (argc == 3 && std::string_view{argv[1]}.starts_with("--write-")) {
         const std::string_view path_bytes = argv[2];
         const auto path = std::filesystem::path(
             std::u8string(reinterpret_cast<const char8_t*>(path_bytes.data()), path_bytes.size()));
-        if (!WriteFixture(path, std::string_view{argv[1]} == "--write-lz4-fixture")) {
-            std::cerr << "could not write synthetic NSO fixture\n";
+        const std::string_view operation = argv[1];
+        std::optional<std::vector<Byte>> fixture;
+        if (operation == "--write-fixture") {
+            fixture = MakeNso();
+        } else if (operation == "--write-lz4-fixture") {
+            fixture = MakeLz4Nso();
+        } else if (operation == "--write-emittable-fixture") {
+            fixture = MakeEmittableNso();
+        } else if (operation == "--write-misaligned-emittable-fixture") {
+            fixture = MakeEmittableNso();
+            PutU32(*fixture, 0x14, 0x1004);
+        } else if (operation == "--write-reversed-emittable-fixture") {
+            fixture = MakeEmittableNso();
+            PutU32(*fixture, 0x24, 0x6000);
+        } else if (operation == "--write-npdm") {
+            fixture = MakeNpdm(true);
+        } else if (operation == "--write-oversized-npdm") {
+            fixture = MakeNpdm(true);
+            fixture->resize(suyu::recomp::MaximumNpdmSize + 1);
+        } else if (operation == "--write-aarch32-npdm") {
+            fixture = MakeNpdm(false, 2);
+        } else if (operation == "--write-unknown-address-npdm") {
+            fixture = MakeNpdm(true, 4);
+        }
+        if (!fixture) {
+            std::cerr << "unknown fixture type\n";
+            return 2;
+        }
+        if (!WriteBytes(path, *fixture)) {
+            std::cerr << "could not write synthetic fixture\n";
             return 1;
         }
         return 0;

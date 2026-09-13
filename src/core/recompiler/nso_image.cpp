@@ -207,6 +207,27 @@ NsoInspection InspectNso(std::span<const std::uint8_t> file) {
     return result;
 }
 
+std::string ValidateNsoExecutableLayout(const NsoInfo& info) {
+    constexpr std::uint32_t PageMask = 0xFFF;
+    for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+        if ((info.segments[i].memory_offset & PageMask) != 0) {
+            return SegmentError(i, "memory offset is not 0x1000-aligned");
+        }
+    }
+
+    const std::uint64_t text_end =
+        static_cast<std::uint64_t>(info.segments[0].memory_offset) + info.segments[0].decoded_size;
+    if (text_end > info.segments[1].memory_offset) {
+        return "text segment ends after the rodata segment begins";
+    }
+    const std::uint64_t rodata_end =
+        static_cast<std::uint64_t>(info.segments[1].memory_offset) + info.segments[1].decoded_size;
+    if (rodata_end > info.segments[2].memory_offset) {
+        return "rodata segment ends after the data segment begins";
+    }
+    return {};
+}
+
 NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file, NsoDecompressor lz4_decompressor,
                           std::uint64_t max_decoded_bytes) {
     NsoDecodeResult result;
@@ -298,7 +319,9 @@ std::uint32_t FindNsoAarch64EntryOffset(std::span<const std::uint8_t> text) {
     }
     const std::int32_t immediate = static_cast<std::int32_t>(instruction << 6) >> 6;
     const std::int64_t target = static_cast<std::int64_t>(immediate) * 4;
-    if (target < 0 || !RangeFits(static_cast<std::uint64_t>(target), 4, text.size())) {
+    const std::uint64_t mod0_end = static_cast<std::uint64_t>(mod0_offset) + MinimumMod0HeaderSize;
+    if (target < 0 || static_cast<std::uint64_t>(target) < mod0_end ||
+        !RangeFits(static_cast<std::uint64_t>(target), 4, text.size())) {
         return 0;
     }
     return static_cast<std::uint32_t>(target);

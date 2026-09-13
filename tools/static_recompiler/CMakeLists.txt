@@ -13,6 +13,8 @@ endif()
 add_library(suyu_recompiler_nso STATIC
     ../../src/core/recompiler/nso_image.cpp
     ../../src/core/recompiler/nso_image.h
+    ../../src/core/recompiler/npdm_info.cpp
+    ../../src/core/recompiler/npdm_info.h
 )
 target_compile_features(suyu_recompiler_nso PUBLIC cxx_std_20)
 target_include_directories(suyu_recompiler_nso PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../../src")
@@ -81,4 +83,16 @@ if((BUILD_TESTING OR YUZU_TESTS) AND NOT CMAKE_CROSSCOMPILING)
             "-DNSO_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/nso_inspect"
             "-P" "${CMAKE_CURRENT_LIST_DIR}/tests/nso_inspect.cmake"
     )
+
+    add_test(
+        NAME static_recompiler_nso_emit
+        COMMAND "${CMAKE_COMMAND}"
+            "-DRECOMP_TOOL=$<TARGET_FILE:suyu_recomp>"
+            "-DNSO_TEST_HELPER=$<TARGET_FILE:nso_image_tests>"
+            "-DNSO_EMIT_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/nso_emit"
+            "-DRECOMP_GENERATOR=${CMAKE_GENERATOR}"
+            "-DRECOMP_C_COMPILER=${CMAKE_C_COMPILER}"
+            "-P" "${CMAKE_CURRENT_LIST_DIR}/tests/nso_emit.cmake"
+    )
+    set_tests_properties(static_recompiler_nso_emit PROPERTIES TIMEOUT 120)
 endif()

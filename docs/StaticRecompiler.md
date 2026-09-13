@@ -27,10 +27,15 @@ rasterizer, and runtime shader translation.
   to suyu memory, SVC dispatch, and a lazy Dynarmic fallback.
 - `core/recompiler/nso_image.{h,cpp}` now provides checked, non-Qt NSO0 inspection and segment
   decoding to both the command-line tool and in-app exporter.
+- `core/recompiler/npdm_info.{h,cpp}` provides a dependency-light, structurally checked NPDM
+  architecture probe; AArch32 is rejected before bytes reach the AArch64 decoder.
 - `suyu/game_export.cpp` retains container/VFS work but now consumes the shared NSO decoder and
   canonical block discovery instead of maintaining a second parser and branch sweep.
-- `tools/static_recompiler` provides deterministic `emit-raw` and `inspect-nso` commands plus
-  synthetic parser, JSON, LZ4, generation, native-build, and execution tests.
+- `tools/static_recompiler` provides deterministic `emit-raw`, `inspect-nso`, and `emit-nso`
+  commands plus synthetic parser, JSON, LZ4, generation, native-build, and execution tests.
+- Generated standalone projects require a 64-bit host, preserve page-aligned NSO segment virtual
+  addresses, validate bundled file sizes, and explicitly map zeroed BSS instead of overlaying every
+  segment at the text base.
 
 ## Milestones
 
@@ -42,13 +47,13 @@ rasterizer, and runtime shader translation.
 
 ### M1: shared executable analysis
 
-- Current slice: checked NSO0 layout/build-ID/segment inspection, bounded decoding, optional LZ4,
-  explicit ZBIC detection, unverified-hash signaling, and architecture-honest human/JSON CLI
-  output.
-- Move NPDM/NSO parsing, decompression, module layout, build-ID extraction, exported-symbol roots,
-  relocation roots, and code-pointer scanning out of the Qt exporter.
-- Add `inspect` and `emit-nso` commands using that shared library.
-- Reject AArch32 modules explicitly until a separate frontend exists.
+- Completed slice: checked NSO0 layout/build-ID/segment inspection, bounded decoding, optional LZ4,
+  explicit ZBIC detection, unverified-hash signaling, structurally validated NPDM architecture
+  probing, and architecture-honest human/JSON CLI output.
+- Completed slice: `emit-nso` decodes the three segments, validates a conventional MOD0/AArch64
+  entry, rejects AArch32, and emits an address-correct C project behind an NPDM or explicit
+  assumption gate.
+- Move exported-symbol roots, relocation roots, and code-pointer scanning out of the Qt exporter.
 - Key output by build ID plus hashes of the post-update, post-mod decompressed segments.
 - Keep decryption/key management outside the recompiler core.
 

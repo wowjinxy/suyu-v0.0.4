@@ -5,9 +5,14 @@ if(NOT DEFINED RECOMP_TOOL OR NOT DEFINED NSO_TEST_HELPER OR NOT DEFINED NSO_TES
     message(FATAL_ERROR "NSO inspect test is missing a required path")
 endif()
 
+if(NOT NSO_TEST_DIR MATCHES "[/\\\\]nso_inspect$")
+    message(FATAL_ERROR "Refusing to clean an unexpected test directory: ${NSO_TEST_DIR}")
+endif()
+
 file(REMOVE_RECURSE "${NSO_TEST_DIR}")
 file(MAKE_DIRECTORY "${NSO_TEST_DIR}")
 set(NSO_FIXTURE "${NSO_TEST_DIR}/synthetic.nso")
+set(NPDM_FIXTURE "${NSO_TEST_DIR}/main.npdm")
 
 execute_process(
     COMMAND "${NSO_TEST_HELPER}" --write-fixture "${NSO_FIXTURE}"
@@ -18,6 +23,34 @@ execute_process(
 if(NOT FIXTURE_RESULT EQUAL 0)
     message(FATAL_ERROR "Could not create synthetic NSO: ${FIXTURE_OUTPUT}${FIXTURE_ERROR}")
 endif()
+
+execute_process(
+    COMMAND "${NSO_TEST_HELPER}" --write-npdm "${NPDM_FIXTURE}"
+    RESULT_VARIABLE NPDM_FIXTURE_RESULT
+    ERROR_VARIABLE NPDM_FIXTURE_ERROR
+)
+if(NOT NPDM_FIXTURE_RESULT EQUAL 0)
+    message(FATAL_ERROR "Could not create synthetic NPDM: ${NPDM_FIXTURE_ERROR}")
+endif()
+
+execute_process(
+    COMMAND "${RECOMP_TOOL}" inspect-nso --input "${NSO_FIXTURE}" --npdm "${NPDM_FIXTURE}"
+    RESULT_VARIABLE NPDM_INSPECT_RESULT
+    OUTPUT_VARIABLE NPDM_INSPECT_OUTPUT
+    ERROR_VARIABLE NPDM_INSPECT_ERROR
+)
+if(NOT NPDM_INSPECT_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "NPDM-backed NSO inspection failed: ${NPDM_INSPECT_OUTPUT}${NPDM_INSPECT_ERROR}")
+endif()
+foreach(EXPECTED "Architecture: AArch64 (main.npdm)"
+                 "NPDM address space: 64-bit (39-bit address space)")
+    string(FIND "${NPDM_INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
+    if(EXPECTED_POSITION EQUAL -1)
+        message(FATAL_ERROR
+            "NPDM-backed inspection is missing '${EXPECTED}':\n${NPDM_INSPECT_OUTPUT}")
+    endif()
+endforeach()
 
 execute_process(
     COMMAND "${RECOMP_TOOL}" inspect-nso --input "${NSO_FIXTURE}" --assume-aarch64
@@ -33,7 +66,7 @@ foreach(EXPECTED
         "Architecture: AArch64 (explicit assumption)"
         "Build ID: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         "text: file=0x100 memory=0x1000 decoded=16 stored=16 compression=none"
-        "AArch64 blocks: 1")
+        "AArch64 analysis: unavailable (could not validate the conventional AArch64 entry stub and MOD0 header)")
     string(FIND "${INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
     if(EXPECTED_POSITION EQUAL -1)
         message(FATAL_ERROR "Inspection output is missing '${EXPECTED}':\n${INSPECT_OUTPUT}")
