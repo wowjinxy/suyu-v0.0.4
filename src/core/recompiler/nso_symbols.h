@@ -19,12 +19,15 @@ constexpr std::uint64_t DefaultNsoDynamicSymbolNameBytesLimit = std::uint64_t{64
 constexpr std::uint8_t NsoElfSymbolBindingLocal = 0;
 constexpr std::uint8_t NsoElfSymbolBindingGlobal = 1;
 constexpr std::uint8_t NsoElfSymbolBindingWeak = 2;
+constexpr std::uint8_t NsoElfSymbolTypeGnuIfunc = 10;
 constexpr std::uint8_t NsoElfSymbolVisibilityDefault = 0;
 constexpr std::uint8_t NsoElfSymbolVisibilityInternal = 1;
 constexpr std::uint8_t NsoElfSymbolVisibilityHidden = 2;
 constexpr std::uint8_t NsoElfSymbolVisibilityProtected = 3;
 constexpr std::uint16_t NsoElfSectionUndefined = 0;
+constexpr std::uint16_t NsoElfSectionLowReserved = 0xFF00;
 constexpr std::uint16_t NsoElfSectionAbsolute = 0xFFF1;
+constexpr std::uint16_t NsoElfSectionCommon = 0xFFF2;
 
 /// One bounded Elf64_Sym record and its name from the NSO header's dynsym/dynstr extents.
 struct NsoDynamicSymbol {
