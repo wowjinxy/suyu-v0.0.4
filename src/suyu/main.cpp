@@ -6376,11 +6376,11 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         }
     });
 
-    // Every image is keyed by an offset within its own module, so the
-    // dispatcher must first work out which module owns this absolute PC -
-    // the image with the greatest base that does not exceed it - before
-    // reducing to an offset and asking that image alone. Asking every image
-    // in turn (as before) would silently return a different module's block
+    // Every exported image lookup accepts an absolute PC and subtracts the
+    // base supplied through recomp_image_set_base itself. The dispatcher must
+    // still work out which module owns the PC - the image with the greatest
+    // base that does not exceed it - before asking that image alone. Asking
+    // every image in turn would silently return a different module's block
     // whenever two modules both define something at the same offset, which
     // they always do at offset 0 (every module's entry block). A plain
     // function pointer is required here, so the table has to be reached via
@@ -6394,7 +6394,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
             }
         }
         if (owner) {
-            if (auto* block = owner->lookup(pc - owner->base)) {
+            if (auto* block = owner->lookup(pc)) {
                 return block;
             }
         }
