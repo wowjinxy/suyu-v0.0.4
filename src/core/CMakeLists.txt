@@ -17,6 +17,8 @@ add_library(core STATIC
     arm/symbols.h
     constants.cpp
     constants.h
+    recompiler/nso_dynamic.cpp
+    recompiler/nso_dynamic.h
     recompiler/nso_image.cpp
     recompiler/nso_image.h
     recompiler/npdm_info.cpp
