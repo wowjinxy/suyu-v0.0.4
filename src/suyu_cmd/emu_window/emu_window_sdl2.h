@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <utility>
 
 #include "core/frontend/emu_window.h"
@@ -37,6 +38,9 @@ public:
 
     /// Wait for the next event on the main thread.
     void WaitEvent();
+
+    /// Supplies the frontend configuration writer used by the F12 controls panel.
+    void SetConfigSaveCallback(std::function<void()> callback);
 
     // Sets the window icon from suyu.bmp
     void SetWindowIcon();
@@ -95,6 +99,9 @@ protected:
 
     /// suyu core instance
     Core::System& system;
+
+    /// Persists live input changes made through the F12 controls panel.
+    std::function<void()> config_save_callback;
 };
 
 class DummyContext : public Core::Frontend::GraphicsContext {};

@@ -913,6 +913,7 @@ int main(int argc, char** argv) {
         emu_window = std::make_unique<EmuWindow_SDL2_VK>(&input_subsystem, system, fullscreen);
         break;
     }
+    emu_window->SetConfigSaveCallback([&config] { config.SaveAllValues(); });
 
 #ifdef _WIN32
     Common::Windows::SetCurrentTimerResolutionToMaximum();

@@ -77,12 +77,19 @@ void DevOpen(const std::filesystem::path& p) {
 struct DevPanelState {
     Core::System* system{};
     InputCommon::InputSubsystem* input{};
+    std::function<void()> save_config;
     HWND status{};
     HWND mods{};
     HWND devices{};
     HWND binds{};
     std::vector<Common::ParamPackage> device_list;
 };
+
+void DevSaveConfig(const DevPanelState& st) {
+    if (st.save_config) {
+        st.save_config();
+    }
+}
 
 // Per-button remapping. Auto-map covers the common case; this covers the rest -
 // pick the entry, press the input you want, done. Same "press what you want"
@@ -129,6 +136,10 @@ void DevBindSelected(DevPanelState& st, bool clear) {
         } else {
             player.buttons[sel].clear();
         }
+        if (st.system != nullptr) {
+            st.system->HIDCore().ReloadInputDevices();
+        }
+        DevSaveConfig(st);
         DevRefreshBinds(st);
         return;
     }
@@ -167,6 +178,7 @@ void DevBindSelected(DevPanelState& st, bool clear) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    DevSaveConfig(st);
     DevRefreshBinds(st);
 }
 
@@ -182,7 +194,7 @@ void DevRefreshDevices(DevPanelState& st) {
     }
     for (const auto& device : st.input->GetInputDevices()) {
         const std::string name = device.Get("display", device.Get("class", "Unknown"));
-        if (name == "Any" || name == "Keyboard/Mouse") {
+        if (name == "Any" || name == "Keyboard/Mouse" || name == "Keyboard Only") {
             continue;
         }
         st.device_list.push_back(device);
@@ -219,6 +231,7 @@ void DevApplyPadMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    DevSaveConfig(st);
     MessageBoxW(nullptr, L"Controller mapped to Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
@@ -249,6 +262,7 @@ void DevApplyKeyboardMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    DevSaveConfig(st);
     MessageBoxW(nullptr, L"Keyboard controls restored for Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
@@ -378,7 +392,8 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
+void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input,
+                 const std::function<void()>& save_config) {
     static bool registered = false;
     static const wchar_t* kClass = L"SuyuGameDebugPanel";
     if (!registered) {
@@ -413,6 +428,7 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
     DevPanelState state{};
     state.system = &system;
     state.input = input;
+    state.save_config = save_config;
     state.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                    WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
                                        ES_AUTOVSCROLL | WS_VSCROLL,
@@ -500,6 +516,10 @@ EmuWindow_SDL2::~EmuWindow_SDL2() {
     SDL_Quit();
 }
 
+void EmuWindow_SDL2::SetConfigSaveCallback(std::function<void()> callback) {
+    config_save_callback = std::move(callback);
+}
+
 InputCommon::MouseButton EmuWindow_SDL2::SDLButtonToMouseButton(u32 button) const {
     switch (button) {
     case SDL_BUTTON_LEFT:
@@ -560,7 +580,7 @@ void EmuWindow_SDL2::OnFingerUp() {
 void EmuWindow_SDL2::OnKeyEvent(int key, u8 state) {
 #ifdef _WIN32
     if (state == SDL_PRESSED && key == SDL_SCANCODE_F12) {
-        ShowDevMenu(system, input_subsystem);
+        ShowDevMenu(system, input_subsystem, config_save_callback);
         return;
     }
 #endif
