@@ -19,10 +19,29 @@ add_library(suyu_recompiler_nso STATIC
 target_compile_features(suyu_recompiler_nso PUBLIC cxx_std_20)
 target_include_directories(suyu_recompiler_nso PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../../src")
 
+set(SUYU_RECOMPILER_MBEDTLS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../externals/mbedtls")
+if(NOT EXISTS "${SUYU_RECOMPILER_MBEDTLS_DIR}/library/sha256.c")
+    message(FATAL_ERROR
+        "The mbedTLS submodule is required for NSO hash verification; initialize submodules")
+endif()
+add_library(suyu_recompiler_sha256 STATIC
+    nso_sha256.cpp
+    nso_sha256.h
+    suyu_recompiler_mbedtls_config.h
+    "${SUYU_RECOMPILER_MBEDTLS_DIR}/library/platform_util.c"
+    "${SUYU_RECOMPILER_MBEDTLS_DIR}/library/sha256.c"
+)
+target_compile_features(suyu_recompiler_sha256 PRIVATE cxx_std_20)
+target_include_directories(suyu_recompiler_sha256 PUBLIC "${CMAKE_CURRENT_LIST_DIR}")
+target_include_directories(suyu_recompiler_sha256 SYSTEM
+    PRIVATE "${SUYU_RECOMPILER_MBEDTLS_DIR}/include")
+target_compile_definitions(suyu_recompiler_sha256
+    PRIVATE MBEDTLS_CONFIG_FILE="suyu_recompiler_mbedtls_config.h")
+
 add_executable(suyu_recomp suyu_recomp.cpp)
 target_compile_features(suyu_recomp PRIVATE cxx_std_20)
 target_include_directories(suyu_recomp PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../src")
-target_link_libraries(suyu_recomp PRIVATE suyu_recompiler_nso)
+target_link_libraries(suyu_recomp PRIVATE suyu_recompiler_nso suyu_recompiler_sha256)
 
 if(NOT TARGET lz4::lz4)
     find_package(lz4 CONFIG QUIET)
@@ -55,7 +74,7 @@ include(CTest)
 if((BUILD_TESTING OR YUZU_TESTS) AND NOT CMAKE_CROSSCOMPILING)
     add_executable(nso_image_tests tests/nso_image_tests.cpp)
     target_compile_features(nso_image_tests PRIVATE cxx_std_20)
-    target_link_libraries(nso_image_tests PRIVATE suyu_recompiler_nso)
+    target_link_libraries(nso_image_tests PRIVATE suyu_recompiler_nso suyu_recompiler_sha256)
     if(MSVC)
         target_compile_options(nso_image_tests PRIVATE /W4 /permissive-)
     else()

@@ -74,12 +74,14 @@ struct NsoInspection {
 
 using NsoDecompressor = bool (*)(std::span<const std::uint8_t> source,
                                  std::span<std::uint8_t> destination);
+using NsoSha256Hasher = bool (*)(std::span<const std::uint8_t> source,
+                                 std::array<std::uint8_t, 0x20>& digest);
 
 struct DecodedNso {
     NsoInfo info;
     std::array<std::vector<std::uint8_t>, NsoSegmentCount> segments;
-    /// True only when no segment requested hash checking. A future hash callback will make it
-    /// possible to set this for hash-protected images too.
+    /// True when every segment whose NSO0 flag requires SHA-256 checking was verified, or when no
+    /// segment requested hash checking.
     bool required_hashes_verified{};
 };
 
@@ -100,11 +102,13 @@ NsoInspection InspectNso(std::span<const std::uint8_t> file);
 /// Returns an empty string when the layout is valid, otherwise a user-facing error.
 std::string ValidateNsoExecutableLayout(const NsoInfo& info);
 
-/// Decodes every segment in a structurally valid NSO0 image. The callback is needed only when a
-/// segment uses LZ4. ZBIC decoding is intentionally not implemented yet.
+/// Decodes every segment in a structurally valid NSO0 image. The decompressor is needed only when
+/// a segment uses LZ4. When supplied, the SHA-256 callback verifies every segment whose NSO0 flag
+/// requires it after decompression. ZBIC decoding is intentionally not implemented yet.
 NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file,
                           NsoDecompressor lz4_decompressor = nullptr,
-                          std::uint64_t max_decoded_bytes = DefaultNsoDecodeLimit);
+                          std::uint64_t max_decoded_bytes = DefaultNsoDecodeLimit,
+                          NsoSha256Hasher sha256_hasher = nullptr);
 
 /// Returns the target of the conventional AArch64 `b` entry stub when text+4 points to a valid
 /// MOD0 header, or zero when that layout cannot be identified. Calling this is an explicit

@@ -55,6 +55,7 @@ rasterizer, and runtime shader translation.
   assumption gate.
 - Real-module validation resolves the entry stub's module-relative MOD0 pointer across text,
   rodata, and data; MOD0 is not assumed to reside beside the entry code.
+- Required NSO0 SHA-256 hashes are checked after decompression before analysis or emission.
 - Move exported-symbol roots, relocation roots, and code-pointer scanning out of the Qt exporter.
 - Key output by build ID plus hashes of the post-update, post-mod decompressed segments.
 - Keep decryption/key management outside the recompiler core.

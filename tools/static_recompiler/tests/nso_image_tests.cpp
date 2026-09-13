@@ -3,6 +3,7 @@
 
 #include "core/recompiler/npdm_info.h"
 #include "core/recompiler/nso_image.h"
+#include "nso_sha256.h"
 
 #include <algorithm>
 #include <array>
@@ -155,6 +156,57 @@ bool IdentityDecompress(std::span<const Byte> source, std::span<Byte> destinatio
     return true;
 }
 
+bool FixtureLz4Decompress(std::span<const Byte> source, std::span<Byte> destination) {
+    if (source.size() != destination.size() + 2 || source[0] != 0xF0 || source[1] != 1) {
+        return false;
+    }
+    std::copy(source.begin() + 2, source.end(), destination.begin());
+    return true;
+}
+
+std::array<Byte, 0x20> MakeTestDigest(std::span<const Byte> source) {
+    std::array<Byte, 0x20> digest{};
+    std::uint32_t state = 2166136261U;
+    for (const Byte value : source) {
+        state ^= value;
+        state *= 16777619U;
+    }
+    state ^= static_cast<std::uint32_t>(source.size());
+    for (std::size_t i = 0; i < digest.size(); ++i) {
+        state ^= state >> 13;
+        state *= 0x5BD1E995U;
+        digest[i] = static_cast<Byte>(state >> ((i & 3) * 8));
+    }
+    return digest;
+}
+
+void PutTestDigest(std::vector<Byte>& bytes, std::size_t segment,
+                   std::span<const Byte> decoded) {
+    const auto digest = MakeTestDigest(decoded);
+    std::copy(digest.begin(), digest.end(), bytes.begin() + 0xA0 + segment * digest.size());
+}
+
+std::size_t hash_call_count = 0;
+std::array<std::size_t, suyu::recomp::NsoSegmentCount> hashed_sizes{};
+
+void ResetHashCalls() {
+    hash_call_count = 0;
+    hashed_sizes.fill(0);
+}
+
+bool TestSha256(std::span<const Byte> source, std::array<Byte, 0x20>& digest) {
+    if (hash_call_count < hashed_sizes.size()) {
+        hashed_sizes[hash_call_count] = source.size();
+    }
+    ++hash_call_count;
+    digest = MakeTestDigest(source);
+    return true;
+}
+
+bool FailingSha256(std::span<const Byte>, std::array<Byte, 0x20>&) {
+    return false;
+}
+
 int failures = 0;
 
 void Check(bool condition, std::string_view description) {
@@ -165,6 +217,17 @@ void Check(bool condition, std::string_view description) {
 }
 
 void RunTests() {
+    constexpr std::array<Byte, 3> Sha256Input{'a', 'b', 'c'};
+    constexpr std::array<Byte, 0x20> ExpectedSha256{
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
+        0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
+        0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    };
+    std::array<Byte, 0x20> sha256_digest{};
+    Check(suyu::recomp::tool::ComputeSha256(Sha256Input, sha256_digest) &&
+              sha256_digest == ExpectedSha256,
+          "bundled SHA-256 backend matches the standard abc vector");
+
     const std::vector<Byte> valid = MakeNso();
     const auto inspection = suyu::recomp::InspectNso(valid);
     Check(static_cast<bool>(inspection), "valid NSO inspects successfully");
@@ -353,6 +416,64 @@ void RunTests() {
                                         return warning.find("not verified") != std::string::npos;
                                     }),
           "hash-required image emits an integrity warning");
+
+    auto verified_hashes = valid;
+    PutU32(verified_hashes, 0x0C, (1U << 3) | (1U << 5));
+    PutTestDigest(verified_hashes, 0, std::span<const Byte>{valid}.subspan(0x100, 0x10));
+    PutTestDigest(verified_hashes, 2, std::span<const Byte>{valid}.subspan(0x118, 0x08));
+    ResetHashCalls();
+    const auto verified = suyu::recomp::DecodeNso(
+        verified_hashes, nullptr, suyu::recomp::DefaultNsoDecodeLimit, TestSha256);
+    Check(verified && verified.image->required_hashes_verified,
+          "matching required hashes are marked verified");
+    Check(verified &&
+              std::none_of(verified.warnings.begin(), verified.warnings.end(),
+                           [](const std::string& warning) {
+                               return warning.find("not verified") != std::string::npos;
+                           }),
+          "successful hash verification does not emit an integrity warning");
+    Check(hash_call_count == 2 && hashed_sizes[0] == 0x10 && hashed_sizes[1] == 0x08,
+          "only hash-required nonempty segments are passed to the hash callback");
+
+    auto mismatched_hash = verified_hashes;
+    mismatched_hash[0xA0] ^= 0xFF;
+    const auto mismatch = suyu::recomp::DecodeNso(
+        mismatched_hash, nullptr, suyu::recomp::DefaultNsoDecodeLimit, TestSha256);
+    Check(!mismatch && mismatch.error.find("does not match") != std::string::npos,
+          "a required segment hash mismatch rejects the image");
+
+    const auto hash_failure = suyu::recomp::DecodeNso(
+        verified_hashes, nullptr, suyu::recomp::DefaultNsoDecodeLimit, FailingSha256);
+    Check(!hash_failure && hash_failure.error.find("could not be computed") != std::string::npos,
+          "a hash-backend failure rejects the image with a clear error");
+
+    auto empty_hash_required = valid;
+    PutU32(empty_hash_required, 0x0C, 1U << 4);
+    PutU32(empty_hash_required, 0x28, 0);
+    PutTestDigest(empty_hash_required, 1, std::span<const Byte>{});
+    ResetHashCalls();
+    const auto empty_verified = suyu::recomp::DecodeNso(
+        empty_hash_required, nullptr, suyu::recomp::DefaultNsoDecodeLimit, TestSha256);
+    Check(empty_verified && empty_verified.image->required_hashes_verified,
+          "a required empty-segment hash is verified");
+    Check(hash_call_count == 1 && hashed_sizes[0] == 0,
+          "the hash callback receives required empty segments");
+
+    auto compressed_hash_required = MakeLz4Nso();
+    PutU32(compressed_hash_required, 0x0C, 1U | (1U << 3));
+    PutTestDigest(compressed_hash_required, 0,
+                  std::span<const Byte>{valid}.subspan(0x100, 0x10));
+    const auto compressed_verified = suyu::recomp::DecodeNso(
+        compressed_hash_required, FixtureLz4Decompress, suyu::recomp::DefaultNsoDecodeLimit,
+        TestSha256);
+    Check(compressed_verified && compressed_verified.image->required_hashes_verified,
+          "required hashes cover decoded rather than compressed segment bytes");
+
+    ResetHashCalls();
+    Check(static_cast<bool>(suyu::recomp::DecodeNso(
+              valid, nullptr, suyu::recomp::DefaultNsoDecodeLimit, TestSha256)) &&
+              hash_call_count == 0,
+          "segments without hash-required flags do not invoke the hash callback");
 
     const std::vector<Byte> npdm64 = MakeNpdm(true);
     const auto npdm64_result = suyu::recomp::InspectNpdm(npdm64);

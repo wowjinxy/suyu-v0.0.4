@@ -62,7 +62,9 @@ refuses AArch32 because the current translator is AArch64-only. `--assume-aarch6
 controlled experiments without an NPDM and prints an explicit warning. The generated standalone
 loader requires a 64-bit host, enforces the page-aligned text/rodata/data order, preserves those
 virtual addresses, resolves module-relative MOD0 pointers across all three segments, checks bundled
-file sizes, and zeros BSS.
+file sizes, verifies every required NSO0 segment hash after decompression, and zeros BSS. The
+standalone tool builds the small SHA-256 component from the repository's mbedTLS submodule; no
+system crypto package is required.
 
 This output is a translation project, not yet a self-contained replacement for a Switch runtime.
 Imports and relocations still require the hosted suyu loader, and the standalone services remain

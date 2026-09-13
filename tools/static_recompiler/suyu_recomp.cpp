@@ -4,6 +4,7 @@
 #include "core/recompiler/arm64_to_c.h"
 #include "core/recompiler/npdm_info.h"
 #include "core/recompiler/nso_image.h"
+#include "nso_sha256.h"
 
 #include <algorithm>
 #include <array>
@@ -632,9 +633,13 @@ int InspectNso(const Options& options) {
     }
 
 #ifdef SUYU_RECOMPILER_HAS_LZ4
-    const auto decoded = suyu::recomp::DecodeNso(*bytes, DecompressLz4);
+    const auto decoded = suyu::recomp::DecodeNso(
+        *bytes, DecompressLz4, suyu::recomp::DefaultNsoDecodeLimit,
+        suyu::recomp::tool::ComputeSha256);
 #else
-    const auto decoded = suyu::recomp::DecodeNso(*bytes);
+    const auto decoded = suyu::recomp::DecodeNso(
+        *bytes, nullptr, suyu::recomp::DefaultNsoDecodeLimit,
+        suyu::recomp::tool::ComputeSha256);
 #endif
     const bool decode_unavailable = !decoded && (info.uses_zbic ||
 #ifdef SUYU_RECOMPILER_HAS_LZ4
@@ -861,12 +866,20 @@ int EmitNso(const Options& options) {
         return 1;
     }
 #ifdef SUYU_RECOMPILER_HAS_LZ4
-    auto decoded = suyu::recomp::DecodeNso(*bytes, DecompressLz4);
+    auto decoded = suyu::recomp::DecodeNso(*bytes, DecompressLz4,
+                                           suyu::recomp::DefaultNsoDecodeLimit,
+                                           suyu::recomp::tool::ComputeSha256);
 #else
-    auto decoded = suyu::recomp::DecodeNso(*bytes);
+    auto decoded = suyu::recomp::DecodeNso(*bytes, nullptr,
+                                           suyu::recomp::DefaultNsoDecodeLimit,
+                                           suyu::recomp::tool::ComputeSha256);
 #endif
     if (!decoded) {
         std::cerr << "error: NSO segment decoding failed: " << decoded.error << '\n';
+        return 1;
+    }
+    if (!decoded.image->required_hashes_verified) {
+        std::cerr << "error: NSO requires segment hashes that were not verified\n";
         return 1;
     }
 

@@ -36,6 +36,8 @@
 #include <span>
 #include <vector>
 
+#include <openssl/evp.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -836,6 +838,14 @@ static bool DecompressNsoLz4(std::span<const std::uint8_t> source,
            static_cast<int>(destination.size());
 }
 
+static bool ComputeNsoSha256(std::span<const std::uint8_t> source,
+                             std::array<std::uint8_t, 0x20>& digest) {
+    unsigned int digest_size = 0;
+    return EVP_Digest(source.data(), source.size(), digest.data(), &digest_size, EVP_sha256(),
+                      nullptr) == 1 &&
+           digest_size == static_cast<unsigned int>(digest.size());
+}
+
 static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFile& nso_file,
                                                        bool full_scan) {
     if (!nso_file) {
@@ -843,13 +853,20 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     }
 
     std::vector<u8> nso_bytes = nso_file->ReadAllBytes();
-    auto decoded = suyu::recomp::DecodeNso(nso_bytes, DecompressNsoLz4);
+    auto decoded = suyu::recomp::DecodeNso(nso_bytes, DecompressNsoLz4,
+                                           suyu::recomp::DefaultNsoDecodeLimit,
+                                           ComputeNsoSha256);
     if (!decoded) {
         LOG_WARNING(Frontend, "Could not decode NSO {}: {}", nso_file->GetName(), decoded.error);
         return std::nullopt;
     }
     for (const std::string& warning : decoded.warnings) {
         LOG_WARNING(Frontend, "NSO {}: {}", nso_file->GetName(), warning);
+    }
+    if (!decoded.image->required_hashes_verified) {
+        LOG_WARNING(Frontend, "NSO {} requires segment hashes that were not verified",
+                    nso_file->GetName());
+        return std::nullopt;
     }
 
     const auto& info = decoded.image->info;

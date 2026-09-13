@@ -282,7 +282,7 @@ std::string ValidateNsoExecutableLayout(const NsoInfo& info) {
 }
 
 NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file, NsoDecompressor lz4_decompressor,
-                          std::uint64_t max_decoded_bytes) {
+                          std::uint64_t max_decoded_bytes, NsoSha256Hasher sha256_hasher) {
     NsoDecodeResult result;
     NsoInspection inspection = InspectNso(file);
     result.warnings = std::move(inspection.warnings);
@@ -308,7 +308,7 @@ NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file, NsoDecompressor lz
         return result;
     }
     decoded.required_hashes_verified = !requires_hash_verification;
-    if (requires_hash_verification) {
+    if (requires_hash_verification && sha256_hasher == nullptr) {
         result.warnings.emplace_back(
             "required segment hashes were not verified by this decoder build");
     }
@@ -316,38 +316,53 @@ NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file, NsoDecompressor lz
     for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
         const NsoSegmentInfo& segment = decoded.info.segments[i];
         std::vector<std::uint8_t>& destination = decoded.segments[i];
-        if (segment.decoded_size == 0) {
-            continue;
-        }
-        const auto source = file.subspan(segment.file_offset, segment.stored_size);
-        try {
-            destination.resize(segment.decoded_size);
-        } catch (const std::bad_alloc&) {
-            result.error = SegmentError(i, "could not allocate its decoded buffer");
-            return result;
-        } catch (const std::length_error&) {
-            result.error = SegmentError(i, "decoded size is unsupported on this host");
-            return result;
+        if (segment.decoded_size != 0) {
+            const auto source = file.subspan(segment.file_offset, segment.stored_size);
+            try {
+                destination.resize(segment.decoded_size);
+            } catch (const std::bad_alloc&) {
+                result.error = SegmentError(i, "could not allocate its decoded buffer");
+                return result;
+            } catch (const std::length_error&) {
+                result.error = SegmentError(i, "decoded size is unsupported on this host");
+                return result;
+            }
+
+            switch (segment.compression) {
+            case NsoCompression::None:
+                std::copy(source.begin(), source.end(), destination.begin());
+                break;
+            case NsoCompression::Lz4:
+                if (lz4_decompressor == nullptr) {
+                    result.error = SegmentError(i, "requires an LZ4 decompressor");
+                    return result;
+                }
+                if (!lz4_decompressor(source, destination)) {
+                    result.error = SegmentError(i, "could not be decompressed with LZ4");
+                    return result;
+                }
+                break;
+            case NsoCompression::Zbic:
+                result.error = SegmentError(i, "uses unsupported ZBIC compression");
+                return result;
+            }
         }
 
-        switch (segment.compression) {
-        case NsoCompression::None:
-            std::copy(source.begin(), source.end(), destination.begin());
-            break;
-        case NsoCompression::Lz4:
-            if (lz4_decompressor == nullptr) {
-                result.error = SegmentError(i, "requires an LZ4 decompressor");
+        if (segment.hash_required && sha256_hasher != nullptr) {
+            std::array<std::uint8_t, 0x20> actual_hash{};
+            if (!sha256_hasher(std::span<const std::uint8_t>{destination}, actual_hash)) {
+                result.error = SegmentError(i, "SHA-256 hash could not be computed");
                 return result;
             }
-            if (!lz4_decompressor(source, destination)) {
-                result.error = SegmentError(i, "could not be decompressed with LZ4");
+            if (actual_hash != segment.expected_hash) {
+                result.error = SegmentError(i, "SHA-256 hash does not match the NSO0 header");
                 return result;
             }
-            break;
-        case NsoCompression::Zbic:
-            result.error = SegmentError(i, "uses unsupported ZBIC compression");
-            return result;
         }
+    }
+
+    if (requires_hash_verification && sha256_hasher != nullptr) {
+        decoded.required_hashes_verified = true;
     }
 
     result.image = std::move(decoded);
