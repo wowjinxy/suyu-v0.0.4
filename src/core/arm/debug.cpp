@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "common/demangle.h"
 #include "core/arm/debug.h"
 #include "core/arm/symbols.h"
@@ -249,6 +251,78 @@ Kernel::KProcessAddress GetModuleEnd(const Kernel::KProcess* process,
     svc_mem_info = mem_info.GetSvcMemoryInfo();
     cur_addr = svc_mem_info.base_address + svc_mem_info.size;
     return cur_addr - 1;
+}
+
+std::optional<u64> GetNsoModuleImageSize(const Kernel::KProcess* process,
+                                         Kernel::KProcessAddress base) {
+    if (process == nullptr) {
+        return std::nullopt;
+    }
+
+    struct MemoryRegion {
+        u64 address;
+        u64 end;
+        Kernel::Svc::MemoryState state;
+        Kernel::Svc::MemoryPermission permission;
+    };
+
+    const auto& page_table = process->GetPageTable();
+    const auto query_region = [&page_table](u64 address) -> std::optional<MemoryRegion> {
+        if (!page_table.Contains(address, 1)) {
+            return std::nullopt;
+        }
+
+        Kernel::KMemoryInfo memory_info{};
+        Kernel::Svc::PageInfo page_info{};
+        const auto query_result =
+            page_table.QueryInfo(std::addressof(memory_info), std::addressof(page_info), address);
+        if (query_result.IsFailure()) {
+            return std::nullopt;
+        }
+
+        const Kernel::Svc::MemoryInfo info = memory_info.GetSvcMemoryInfo();
+        if (info.size == 0 || info.size > std::numeric_limits<u64>::max() - info.base_address) {
+            return std::nullopt;
+        }
+        const u64 end = info.base_address + info.size;
+        if (info.base_address > address || address >= end) {
+            return std::nullopt;
+        }
+        return MemoryRegion{
+            .address = info.base_address,
+            .end = end,
+            .state = info.state,
+            .permission = info.permission,
+        };
+    };
+
+    const u64 module_base = GetInteger(base);
+    const auto text = query_region(module_base);
+    // Executable images mapped through the alias-code path use the same permission sequence;
+    // accepting that family is safe only when all three regions remain consistently aliased.
+    if (!text || text->address != module_base ||
+        text->permission != Kernel::Svc::MemoryPermission::ReadExecute ||
+        (text->state != Kernel::Svc::MemoryState::Code &&
+         text->state != Kernel::Svc::MemoryState::AliasCode)) {
+        return std::nullopt;
+    }
+
+    const auto rodata = query_region(text->end);
+    if (!rodata || rodata->address != text->end || rodata->state != text->state ||
+        rodata->permission != Kernel::Svc::MemoryPermission::Read) {
+        return std::nullopt;
+    }
+
+    const Kernel::Svc::MemoryState expected_data_state =
+        text->state == Kernel::Svc::MemoryState::Code ? Kernel::Svc::MemoryState::CodeData
+                                                      : Kernel::Svc::MemoryState::AliasCodeData;
+    const auto data = query_region(rodata->end);
+    if (!data || data->address != rodata->end || data->state != expected_data_state ||
+        data->permission != Kernel::Svc::MemoryPermission::ReadWrite || data->end <= module_base) {
+        return std::nullopt;
+    }
+
+    return data->end - module_base;
 }
 
 Loader::AppLoader::Modules FindModules(Kernel::KProcess* process) {
