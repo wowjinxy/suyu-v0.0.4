@@ -14,6 +14,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #include <fmt/ostream.h>
 
@@ -291,6 +296,103 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
 /// process is a standalone game export, not the suyu dev frontend.
 bool g_native_export_mode = false;
 
+#ifdef SUYU_CMD_STATIC_RECOMP
+static std::filesystem::path GetStaticExportDirectory() {
+#ifdef _WIN32
+    wchar_t executable_path[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable_path,
+                                            static_cast<DWORD>(std::size(executable_path)));
+    if (length == 0 || length >= std::size(executable_path)) {
+        return {};
+    }
+    return std::filesystem::path{executable_path}.parent_path();
+#elif defined(__linux__)
+    std::error_code ec;
+    const auto executable_path = std::filesystem::canonical("/proc/self/exe", ec);
+    return ec ? std::filesystem::path{} : executable_path.parent_path();
+#elif defined(__APPLE__)
+    uint32_t path_size{};
+    if (_NSGetExecutablePath(nullptr, &path_size) != -1 || path_size == 0) {
+        return {};
+    }
+    std::vector<char> executable_path(path_size);
+    if (_NSGetExecutablePath(executable_path.data(), &path_size) != 0) {
+        return {};
+    }
+    std::error_code ec;
+    const auto canonical_path =
+        std::filesystem::weakly_canonical(std::filesystem::path{executable_path.data()}, ec);
+    return ec ? std::filesystem::path{} : canonical_path.parent_path();
+#else
+    return {};
+#endif
+}
+
+static bool ConfigureStaticExportPaths() {
+    namespace FS = Common::FS;
+
+    const auto executable_directory = GetStaticExportDirectory();
+    if (executable_directory.empty() || !executable_directory.is_absolute()) {
+        std::cerr << "Unable to resolve the static export executable directory\n";
+        return false;
+    }
+    const auto user_root = executable_directory / "user";
+#ifdef _WIN32
+    const auto keys_root = FS::GetAppDataRoamingDirectory() / "suyu" / "keys";
+#else
+    const auto keys_root = FS::GetDataDirectory("XDG_DATA_HOME") / "suyu" / "keys";
+#endif
+    if (keys_root.empty() || !keys_root.is_absolute()) {
+        std::cerr << "Unable to resolve an external keys directory\n";
+        return false;
+    }
+
+    const auto ensure_directory = [](const std::filesystem::path& path,
+                                     std::string_view description) {
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+        if (ec || !std::filesystem::is_directory(path, ec)) {
+            std::cerr << "Unable to create " << description << " directory: " << path.string()
+                      << "\n";
+            return false;
+        }
+        return true;
+    };
+
+    if (!ensure_directory(user_root, "static export user") ||
+        !ensure_directory(keys_root, "external keys")) {
+        return false;
+    }
+    for (const char* sub : {"config", "cache", "cache/shader", "log", "nand", "sdmc", "dump",
+                             "load", "screenshots", "play_time", "crash_dumps", "amiibo", "tas",
+                             "icons", "themes"}) {
+        if (!ensure_directory(user_root / sub, "static export data")) {
+            return false;
+        }
+    }
+
+    FS::SetSuyuPath(FS::SuyuPath::EdenDir, user_root);
+    FS::SetSuyuPath(FS::SuyuPath::ConfigDir, user_root / "config");
+    FS::SetSuyuPath(FS::SuyuPath::CacheDir, user_root / "cache");
+    FS::SetSuyuPath(FS::SuyuPath::ShaderDir, user_root / "cache" / "shader");
+    FS::SetSuyuPath(FS::SuyuPath::LogDir, user_root / "log");
+    FS::SetSuyuPath(FS::SuyuPath::NANDDir, user_root / "nand");
+    FS::SetSuyuPath(FS::SuyuPath::SaveDir, user_root / "nand");
+    FS::SetSuyuPath(FS::SuyuPath::SDMCDir, user_root / "sdmc");
+    FS::SetSuyuPath(FS::SuyuPath::DumpDir, user_root / "dump");
+    FS::SetSuyuPath(FS::SuyuPath::LoadDir, user_root / "load");
+    FS::SetSuyuPath(FS::SuyuPath::ScreenshotsDir, user_root / "screenshots");
+    FS::SetSuyuPath(FS::SuyuPath::PlayTimeDir, user_root / "play_time");
+    FS::SetSuyuPath(FS::SuyuPath::CrashDumpsDir, user_root / "crash_dumps");
+    FS::SetSuyuPath(FS::SuyuPath::AmiiboDir, user_root / "amiibo");
+    FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
+    FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
+    FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
+    FS::SetSuyuPath(FS::SuyuPath::KeysDir, keys_root);
+    return true;
+}
+#endif
+
 /// Application entry point
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -313,46 +415,8 @@ int main(int argc, char** argv) {
     // never bundled with a distributed export.
     // Must run before Log::Initialize(), which opens a file under LogDir.
 #ifdef SUYU_CMD_STATIC_RECOMP
-    {
-        namespace FS = Common::FS;
-#ifdef _WIN32
-        wchar_t exe_w[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
-        const std::filesystem::path user_root =
-            std::filesystem::path(exe_w).parent_path() / L"user";
-#else
-        const std::filesystem::path user_root =
-            std::filesystem::path(argv[0]).parent_path() / "user";
-#endif
-        std::filesystem::create_directories(user_root);
-        // SetSuyuPath (path_util.cpp) fails with "is not a directory" if the
-        // path doesn't exist yet - most of these get created lazily by
-        // whatever subsystem first writes into them, but LoadDir/TASDir are
-        // read from (mod scan, TAS script lookup) before anything writes to
-        // them, so create every subdir up front instead of relying on that.
-        for (const char* sub : {"config", "cache", "cache/shader", "log", "nand", "sdmc", "dump",
-                                 "load", "screenshots", "play_time", "crash_dumps", "amiibo", "tas",
-                                 "icons", "themes"}) {
-            std::filesystem::create_directories(user_root / sub);
-        }
-        FS::SetSuyuPath(FS::SuyuPath::EdenDir, user_root);
-        FS::SetSuyuPath(FS::SuyuPath::ConfigDir, user_root / "config");
-        FS::SetSuyuPath(FS::SuyuPath::CacheDir, user_root / "cache");
-        FS::SetSuyuPath(FS::SuyuPath::ShaderDir, user_root / "cache" / "shader");
-        FS::SetSuyuPath(FS::SuyuPath::LogDir, user_root / "log");
-        FS::SetSuyuPath(FS::SuyuPath::NANDDir, user_root / "nand");
-        FS::SetSuyuPath(FS::SuyuPath::SaveDir, user_root / "nand");
-        FS::SetSuyuPath(FS::SuyuPath::SDMCDir, user_root / "sdmc");
-        FS::SetSuyuPath(FS::SuyuPath::DumpDir, user_root / "dump");
-        FS::SetSuyuPath(FS::SuyuPath::LoadDir, user_root / "load");
-        FS::SetSuyuPath(FS::SuyuPath::ScreenshotsDir, user_root / "screenshots");
-        FS::SetSuyuPath(FS::SuyuPath::PlayTimeDir, user_root / "play_time");
-        FS::SetSuyuPath(FS::SuyuPath::CrashDumpsDir, user_root / "crash_dumps");
-        FS::SetSuyuPath(FS::SuyuPath::AmiiboDir, user_root / "amiibo");
-        FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
-        FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
-        FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
-        FS::SetSuyuPath(FS::SuyuPath::KeysDir, FS::GetAppDataRoamingDirectory() / "suyu" / "keys");
+    if (!ConfigureStaticExportPaths()) {
+        return -1;
     }
 #endif
 
@@ -487,6 +551,15 @@ int main(int argc, char** argv) {
     }
 
     SdlConfig config{config_path};
+
+#ifdef SUYU_CMD_STATIC_RECOMP
+    // A copied config can contain absolute paths from a different machine or
+    // package location. Reassert the export-local data roots after config
+    // loading, while keeping keys in the external application data directory.
+    if (!ConfigureStaticExportPaths()) {
+        return -1;
+    }
+#endif
 
     // apply the log_filter setting
     // the logger was initialized before and doesn't pick up the filter on its own

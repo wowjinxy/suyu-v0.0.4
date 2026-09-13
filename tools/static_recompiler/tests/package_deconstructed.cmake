@@ -188,6 +188,11 @@ endforeach()
 
 file(READ "${package_dir}/launch.cmd" launch_script)
 string(FIND "${launch_script}"
+    "--game \"%~dp0exefs\\main\"" absolute_game_path_position)
+if(absolute_game_path_position EQUAL -1)
+    message(FATAL_ERROR "launch.cmd does not use an absolute package-local game path")
+endif()
+string(FIND "${launch_script}"
     "--applet-params=\"72057594037993472,3,3,0,0,-1\"" applet_parameters_position)
 if(applet_parameters_position EQUAL -1)
     message(FATAL_ERROR "launch.cmd does not contain the exact synthetic applet parameters")

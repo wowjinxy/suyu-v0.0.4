@@ -17,6 +17,7 @@ add_executable(tests
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
+    core/crypto/aes_util.cpp
     core/internal_network/network.cpp
     core/romfs.cpp
     video_core/memory_tracker.cpp

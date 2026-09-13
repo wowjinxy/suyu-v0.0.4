@@ -538,7 +538,10 @@ try {
     Copy-Item -LiteralPath $hostExecutable -Destination $packagedHostPath
 
     $programIdDecimal = $programIdValue.ToString($InvariantCulture)
-    $commandLine = '"suyu-recompiled.exe" --game "exefs\main"'
+    # Give RealVfs an absolute path. A relative top-level `exefs` directory has
+    # no representable parent in RealVfsDirectory, which prevents the loader
+    # from discovering a sibling extracted RomFS at the package root.
+    $commandLine = '"suyu-recompiled.exe" --game "%~dp0exefs\main"'
     if ($LaunchMode -eq "Applet") {
         $appletParameters = "{0},{1},{2},{3},{4},{5}" -f `
             $programIdDecimal, $manifestAppletId, $manifestAppletType, $manifestLaunchType,
