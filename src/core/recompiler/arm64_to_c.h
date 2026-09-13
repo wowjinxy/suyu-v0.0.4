@@ -612,7 +612,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 s += "_r = (_s >> " + std::to_string(immr) + ")";
                 if (nbits < 64) s += " & ((1ULL << " + std::to_string(nbits) + ") - 1)";
                 s += "; ";
-                if (opc == 0) { // SBFM: sign-extend from nbits
+                if (opc == 0 && nbits < 64) { // SBFM: sign-extend from nbits
                     s += "if (_r & (1ULL << " + std::to_string(nbits - 1) + ")) _r |= ~((1ULL << " +
                          std::to_string(nbits) + ") - 1); ";
                 }
@@ -623,7 +623,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 s += "_r = (_s";
                 if (nbits < 64) s += " & ((1ULL << " + std::to_string(nbits) + ") - 1)";
                 s += ") << " + std::to_string(shift) + "; ";
-                if (opc == 0) {
+                if (opc == 0 && shift + nbits < 64) {
                     s += "if (_r & (1ULL << " + std::to_string(shift + nbits - 1) +
                          ")) _r |= ~((1ULL << " + std::to_string(shift + nbits) + ") - 1); ";
                 }
