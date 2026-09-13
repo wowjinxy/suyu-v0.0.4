@@ -20,6 +20,11 @@ std::uint32_t ReadU32(std::span<const std::uint8_t> bytes, std::size_t offset) {
            (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
 }
 
+std::uint64_t ReadU64(std::span<const std::uint8_t> bytes, std::size_t offset) {
+    return static_cast<std::uint64_t>(ReadU32(bytes, offset)) |
+           (static_cast<std::uint64_t>(ReadU32(bytes, offset + 4)) << 32);
+}
+
 bool HasMagic(std::span<const std::uint8_t> bytes, std::size_t offset, const char (&magic)[5]) {
     return offset <= bytes.size() && 4 <= bytes.size() - offset && bytes[offset] == magic[0] &&
            bytes[offset + 1] == magic[1] && bytes[offset + 2] == magic[2] &&
@@ -119,6 +124,7 @@ NpdmInspection InspectNpdm(std::span<const std::uint8_t> file) {
         result.error = "invalid ACI0 magic";
         return result;
     }
+    info.program_id = ReadU64(file, static_cast<std::size_t>(info.aci_offset) + 0x10);
     if (!HasMagic(file, static_cast<std::size_t>(info.acid_offset) + 0x200, "ACID")) {
         result.error = "invalid ACID magic";
         return result;

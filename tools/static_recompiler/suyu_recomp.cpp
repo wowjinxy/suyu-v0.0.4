@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -65,6 +66,11 @@ struct Options {
     bool json = false;
     bool assume_aarch64 = false;
     bool have_npdm = false;
+};
+
+struct MappedTextIdentity {
+    std::size_t size{};
+    std::array<u8, 0x20> sha256{};
 };
 
 void PrintUsage(std::ostream& out, std::string_view executable) {
@@ -145,6 +151,33 @@ bool IsModuleName(std::string_view name) {
 std::string PathToUtf8(const std::filesystem::path& path) {
     const auto bytes = path.u8string();
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+std::optional<MappedTextIdentity> ComputeMappedTextIdentity(std::span<const u8> text,
+                                                            std::string& error) {
+    constexpr std::size_t TextPageSize = 0x1000;
+    if (text.size() > std::numeric_limits<std::size_t>::max() - (TextPageSize - 1)) {
+        error = "mapped NSO text size overflows this host";
+        return std::nullopt;
+    }
+
+    MappedTextIdentity identity{
+        .size = (text.size() + TextPageSize - 1) & ~(TextPageSize - 1),
+    };
+    std::vector<u8> mapped_text;
+    try {
+        mapped_text.assign(text.begin(), text.end());
+        mapped_text.resize(identity.size, 0);
+    } catch (const std::exception& exception) {
+        error = std::string{"could not allocate the page-aligned NSO text image: "} +
+                exception.what();
+        return std::nullopt;
+    }
+    if (!suyu::recomp::tool::ComputeSha256(mapped_text, identity.sha256)) {
+        error = "could not hash the page-aligned NSO text image";
+        return std::nullopt;
+    }
+    return identity;
 }
 
 #ifdef _WIN32
@@ -476,6 +509,16 @@ std::string Hex(u64 value) {
     return "0x" + result;
 }
 
+std::string FixedHex(u64 value) {
+    constexpr char Digits[] = "0123456789abcdef";
+    std::string result(16, '0');
+    for (std::size_t i = result.size(); i > 0; --i) {
+        result[i - 1] = Digits[value & 0xF];
+        value >>= 4;
+    }
+    return result;
+}
+
 std::string JsonEscape(std::string_view value) {
     constexpr char Digits[] = "0123456789abcdef";
     std::string result;
@@ -724,6 +767,16 @@ int InspectNso(const Options& options) {
         std::cerr << "error: NSO segment decoding failed: " << decoded.error << '\n';
         return 1;
     }
+    std::optional<MappedTextIdentity> mapped_text_identity;
+    if (decoded) {
+        std::string identity_error;
+        mapped_text_identity =
+            ComputeMappedTextIdentity(decoded.image->segments[0], identity_error);
+        if (!mapped_text_identity) {
+            std::cerr << "error: " << identity_error << '\n';
+            return 1;
+        }
+    }
     std::vector<std::string> warnings = decoded.warnings;
     if (npdm) {
         warnings.insert(warnings.end(), npdm->warnings.begin(), npdm->warnings.end());
@@ -814,7 +867,8 @@ int InspectNso(const Options& options) {
                       << (npdm->info.address_space
                               ? suyu::recomp::NpdmAddressSpaceName(*npdm->info.address_space)
                               : "unknown")
-                      << '\n';
+                      << '\n'
+                      << "Program ID: " << FixedHex(npdm->info.program_id) << '\n';
         }
         std::cout << "Build ID: " << build_id << '\n'
                   << "Execute-only text: " << (info.execute_only ? "yes" : "no") << '\n'
@@ -844,10 +898,14 @@ int InspectNso(const Options& options) {
         if (decoded) {
             std::cout << "Segments decoded: yes\n";
             std::cout << "Required hashes verified: "
-                      << (decoded.image->required_hashes_verified ? "yes" : "no") << '\n';
+                      << (decoded.image->required_hashes_verified ? "yes" : "no") << '\n'
+                      << "Mapped text size: " << mapped_text_identity->size << '\n'
+                      << "Mapped text SHA-256: "
+                      << suyu::recomp::NsoBuildIdToHex(mapped_text_identity->sha256) << '\n';
         } else {
             std::cout << "Segments decoded: no (" << decoded.error << ")\n";
-            std::cout << "Required hashes verified: unavailable\n";
+            std::cout << "Required hashes verified: unavailable\n"
+                      << "Mapped text identity: unavailable\n";
         }
         if (analyze_aarch64) {
             if (aarch64_error.empty()) {
@@ -945,7 +1003,13 @@ int InspectNso(const Options& options) {
                   : npdm                 ? "\"npdm\""
                                          : "null")
               << ",\n"
-              << "  \"build_id\": \"" << build_id << "\",\n"
+              << "  \"program_id\": ";
+    if (npdm) {
+        std::cout << "\"" << FixedHex(npdm->info.program_id) << "\",\n";
+    } else {
+        std::cout << "null,\n";
+    }
+    std::cout << "  \"build_id\": \"" << build_id << "\",\n"
               << "  \"execute_only\": " << (info.execute_only ? "true" : "false") << ",\n"
               << "  \"bss_size\": " << info.bss_size << ",\n"
               << "  \"module_name\": {\"offset\": \"" << Hex(info.module_name_offset)
@@ -986,6 +1050,19 @@ int InspectNso(const Options& options) {
         std::cout << "null,\n";
     } else {
         std::cout << "\"" << JsonEscape(decoded.error) << "\",\n";
+    }
+    std::cout << "  \"mapped_text_size\": ";
+    if (mapped_text_identity) {
+        std::cout << mapped_text_identity->size << ",\n";
+    } else {
+        std::cout << "null,\n";
+    }
+    std::cout << "  \"mapped_text_sha256\": ";
+    if (mapped_text_identity) {
+        std::cout << "\"" << suyu::recomp::NsoBuildIdToHex(mapped_text_identity->sha256)
+                  << "\",\n";
+    } else {
+        std::cout << "null,\n";
     }
     std::cout << "  \"aarch64_analysis\": ";
     if (!analyze_aarch64) {
@@ -1150,14 +1227,10 @@ int EmitNso(const Options& options) {
         return 1;
     }
     const u64 entry = base + entry_offset;
-    constexpr std::size_t TextPageSize = 0x1000;
-    const std::size_t mapped_text_size =
-        (text.size() + TextPageSize - 1) & ~(TextPageSize - 1);
-    std::vector<u8> mapped_text{text};
-    mapped_text.resize(mapped_text_size, 0);
-    std::array<u8, 0x20> text_sha256{};
-    if (!suyu::recomp::tool::ComputeSha256(mapped_text, text_sha256)) {
-        std::cerr << "error: could not hash the page-aligned NSO text image\n";
+    std::string identity_error;
+    const auto mapped_text_identity = ComputeMappedTextIdentity(text, identity_error);
+    if (!mapped_text_identity) {
+        std::cerr << "error: " << identity_error << '\n';
         return 1;
     }
     if (!ValidateOutputDirectory(options)) {
@@ -1171,7 +1244,8 @@ int EmitNso(const Options& options) {
             data.empty() ? nullptr : data.data(), data.size(), entry, options.title, nullptr,
             suyu::recomp::RecompileImageLayout{info.segments[1].memory_offset,
                                                info.segments[2].memory_offset, info.bss_size},
-            &info.build_id, &text_sha256, static_cast<u64>(mapped_text_size));
+            &info.build_id, &mapped_text_identity->sha256,
+            static_cast<u64>(mapped_text_identity->size));
         if (!ValidateGeneratedProject(options, !rodata.empty(), !data.empty())) {
             return 1;
         }

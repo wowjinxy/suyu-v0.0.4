@@ -44,6 +44,7 @@ struct NpdmInfo {
     std::uint32_t aci_size{};
     std::uint32_t acid_offset{};
     std::uint32_t acid_size{};
+    std::uint64_t program_id{};
 };
 
 struct NpdmInspection {
@@ -57,7 +58,8 @@ struct NpdmInspection {
 };
 
 /// Parses the META header and validates the top-level ACI0 and ACID regions before exposing the
-/// architecture bit. Signature and permission verification are outside this lightweight probe.
+/// architecture and ACI0 program ID. Signature and permission verification are outside this
+/// lightweight probe.
 NpdmInspection InspectNpdm(std::span<const std::uint8_t> file);
 
 const char* NpdmArchitectureName(NpdmArchitecture architecture);

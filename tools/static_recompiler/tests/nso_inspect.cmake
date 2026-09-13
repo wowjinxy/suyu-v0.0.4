@@ -44,13 +44,32 @@ if(NOT NPDM_INSPECT_RESULT EQUAL 0)
         "NPDM-backed NSO inspection failed: ${NPDM_INSPECT_OUTPUT}${NPDM_INSPECT_ERROR}")
 endif()
 foreach(EXPECTED "Architecture: AArch64 (main.npdm)"
-                 "NPDM address space: 64-bit (39-bit address space)")
+                 "NPDM address space: 64-bit (39-bit address space)"
+                 "Program ID: 0100000000010000")
     string(FIND "${NPDM_INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
     if(EXPECTED_POSITION EQUAL -1)
         message(FATAL_ERROR
             "NPDM-backed inspection is missing '${EXPECTED}':\n${NPDM_INSPECT_OUTPUT}")
     endif()
 endforeach()
+
+execute_process(
+    COMMAND "${RECOMP_TOOL}" inspect-nso --input "${NSO_FIXTURE}" --npdm "${NPDM_FIXTURE}" --json
+    RESULT_VARIABLE NPDM_JSON_RESULT
+    OUTPUT_VARIABLE NPDM_JSON_OUTPUT
+    ERROR_VARIABLE NPDM_JSON_ERROR
+)
+if(NOT NPDM_JSON_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "NPDM-backed JSON inspection failed: ${NPDM_JSON_OUTPUT}${NPDM_JSON_ERROR}")
+endif()
+string(JSON NPDM_PROGRAM_ID_TYPE TYPE "${NPDM_JSON_OUTPUT}" program_id)
+string(JSON NPDM_PROGRAM_ID GET "${NPDM_JSON_OUTPUT}" program_id)
+if(NOT NPDM_PROGRAM_ID_TYPE STREQUAL "STRING" OR
+   NOT NPDM_PROGRAM_ID STREQUAL "0100000000010000")
+    message(FATAL_ERROR
+        "NPDM-backed JSON inspection has an invalid program ID:\n${NPDM_JSON_OUTPUT}")
+endif()
 
 execute_process(
     COMMAND "${RECOMP_TOOL}" inspect-nso --input "${NSO_FIXTURE}" --assume-aarch64
@@ -66,6 +85,8 @@ foreach(EXPECTED
         "Architecture: AArch64 (explicit assumption)"
         "Build ID: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         "text: file=0x100 memory=0x1000 decoded=16 stored=16 compression=none"
+        "Mapped text size: 4096"
+        "Mapped text SHA-256: d6277c609aa7d18c9d08152a86ae6cac812d224bfa18405a631c56ca9694208a"
         "AArch64 analysis: unavailable (could not validate the conventional AArch64 entry stub and MOD0 header)"
         "ELF64 dynamic analysis: unavailable (MOD0 offset at text+4 is invalid)")
     string(FIND "${INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
@@ -222,6 +243,23 @@ foreach(EXPECTED
         message(FATAL_ERROR "JSON output is missing '${EXPECTED}':\n${JSON_OUTPUT}")
     endif()
 endforeach()
+
+string(JSON PROGRAM_ID_TYPE TYPE "${JSON_OUTPUT}" program_id)
+string(JSON MAPPED_TEXT_SIZE_TYPE TYPE "${JSON_OUTPUT}" mapped_text_size)
+string(JSON MAPPED_TEXT_SIZE GET "${JSON_OUTPUT}" mapped_text_size)
+string(JSON MAPPED_TEXT_SHA256_TYPE TYPE "${JSON_OUTPUT}" mapped_text_sha256)
+string(JSON MAPPED_TEXT_SHA256 GET "${JSON_OUTPUT}" mapped_text_sha256)
+if(NOT PROGRAM_ID_TYPE STREQUAL "NULL")
+    message(FATAL_ERROR "NPDM-less JSON program ID must be null:\n${JSON_OUTPUT}")
+endif()
+if(NOT MAPPED_TEXT_SIZE_TYPE STREQUAL "NUMBER" OR NOT MAPPED_TEXT_SIZE EQUAL 4096)
+    message(FATAL_ERROR "JSON mapped text size is invalid:\n${JSON_OUTPUT}")
+endif()
+if(NOT MAPPED_TEXT_SHA256_TYPE STREQUAL "STRING" OR
+   NOT MAPPED_TEXT_SHA256 STREQUAL
+       "d6277c609aa7d18c9d08152a86ae6cac812d224bfa18405a631c56ca9694208a")
+    message(FATAL_ERROR "JSON mapped text SHA-256 is invalid:\n${JSON_OUTPUT}")
+endif()
 
 string(JSON UNKNOWN_DYNAMIC_TYPE TYPE "${JSON_OUTPUT}" dynamic_analysis)
 if(NOT UNKNOWN_DYNAMIC_TYPE STREQUAL "NULL")

@@ -239,6 +239,7 @@ std::vector<Byte> MakeDynamicNso() {
 }
 
 std::vector<Byte> MakeNpdm(bool aarch64, std::uint8_t address_space = 3) {
+    constexpr std::uint64_t ProgramId = 0x0100000000010000ULL;
     std::vector<Byte> bytes(0x300);
     std::copy_n(reinterpret_cast<const Byte*>("META"), 4, bytes.begin());
     bytes[0x0C] = static_cast<Byte>((aarch64 ? 1 : 0) | (address_space << 1));
@@ -254,6 +255,7 @@ std::vector<Byte> MakeNpdm(bool aarch64, std::uint8_t address_space = 3) {
         PutU32(bytes, offset, 0x240);
     }
     std::copy_n(reinterpret_cast<const Byte*>("ACI0"), 4, bytes.begin() + 0x2C0);
+    PutU64(bytes, 0x2D0, ProgramId);
     for (const std::size_t offset : {0x2E0, 0x2E8, 0x2F0}) {
         PutU32(bytes, offset, 0x40);
     }
@@ -596,6 +598,8 @@ void RunTests() {
         Check(npdm64_result.info->address_space ==
                   suyu::recomp::NpdmAddressSpace::AddressSpace64Bit,
               "NPDM address-space bits are decoded independently");
+        Check(npdm64_result.info->program_id == 0x0100000000010000ULL,
+              "NPDM ACI0 program ID is decoded");
     }
     const auto npdm32_result = suyu::recomp::InspectNpdm(MakeNpdm(false, 2));
     Check(npdm32_result &&
