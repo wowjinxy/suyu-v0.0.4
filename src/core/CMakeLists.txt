@@ -21,6 +21,8 @@ add_library(core STATIC
     recompiler/nso_dynamic.h
     recompiler/nso_image.cpp
     recompiler/nso_image.h
+    recompiler/nso_symbols.cpp
+    recompiler/nso_symbols.h
     recompiler/npdm_info.cpp
     recompiler/npdm_info.h
     core.cpp

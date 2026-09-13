@@ -15,6 +15,8 @@ add_library(suyu_recompiler_nso STATIC
     ../../src/core/recompiler/nso_dynamic.h
     ../../src/core/recompiler/nso_image.cpp
     ../../src/core/recompiler/nso_image.h
+    ../../src/core/recompiler/nso_symbols.cpp
+    ../../src/core/recompiler/nso_symbols.h
     ../../src/core/recompiler/npdm_info.cpp
     ../../src/core/recompiler/npdm_info.h
 )
@@ -93,6 +95,16 @@ if((BUILD_TESTING OR YUZU_TESTS) AND NOT CMAKE_CROSSCOMPILING)
         target_compile_options(nso_dynamic_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME static_recompiler_nso_dynamic COMMAND nso_dynamic_tests)
+
+    add_executable(nso_symbols_tests tests/nso_symbols_tests.cpp)
+    target_compile_features(nso_symbols_tests PRIVATE cxx_std_20)
+    target_link_libraries(nso_symbols_tests PRIVATE suyu_recompiler_nso)
+    if(MSVC)
+        target_compile_options(nso_symbols_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(nso_symbols_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME static_recompiler_nso_symbols COMMAND nso_symbols_tests)
 
     add_executable(nso_image_tests tests/nso_image_tests.cpp)
     target_compile_features(nso_image_tests PRIVATE cxx_std_20)
