@@ -16,6 +16,7 @@ namespace Core {
 
 class System;
 class DynarmicExclusiveMonitor;
+class ArmRecompProcessState;
 
 /**
  * Signature of a recompiled block produced by suyu::recomp::EmitProject.
@@ -64,6 +65,16 @@ void SetRecompBaseSetter(RecompBaseFn setter);
 RecompLookupFn GetRecompLookup();
 
 /**
+ * Creates the initialization state shared by every ArmRecomp core belonging
+ * to one guest process.
+ *
+ * The definition stays private to the backend; KProcess owns one handle and
+ * passes it to each core so module registration and relocation happen once
+ * for that process rather than once per core (or once globally).
+ */
+std::shared_ptr<ArmRecompProcessState> CreateArmRecompProcessState();
+
+/**
  * CPU backend that executes statically recompiled AArch64 rather than JITing
  * it.
  *
@@ -91,6 +102,7 @@ public:
     /// debugger that is not attached and the game hangs on a black screen with
     /// no forward progress.
     explicit ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
+                       std::shared_ptr<ArmRecompProcessState> process_state,
                        Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
                        std::size_t core_index);
     ~ArmRecomp() override;

@@ -5,8 +5,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/logging/log.h"
@@ -115,8 +117,21 @@ RecompLookupFn GetRecompLookup() {
     return g_recomp_lookup.load(std::memory_order_acquire);
 }
 
+class ArmRecompProcessState {
+public:
+    std::once_flag initialize_once;
+    std::once_flag announce_once;
+    Loader::AppLoader::Modules modules;
+};
+
+std::shared_ptr<ArmRecompProcessState> CreateArmRecompProcessState() {
+    return std::make_shared<ArmRecompProcessState>();
+}
+
 struct ArmRecomp::Impl {
-    Impl(System& system_, RecompLookupFn lookup_) : system{system_}, lookup{lookup_} {
+    Impl(System& system_, RecompLookupFn lookup_,
+         std::shared_ptr<ArmRecompProcessState> process_state_)
+        : system{system_}, lookup{lookup_}, process_state{std::move(process_state_)} {
         std::memset(&ctx, 0, sizeof(ctx));
         ctx.pending_svc = kNoPendingSvc;
         // Point the recompiled code at the emulator's address space.
@@ -146,32 +161,32 @@ struct ArmRecomp::Impl {
         }
     }
 
-    /// Base address of the module containing `pc`, so an address can be turned
-    /// into the module-relative offset a recompiled image is keyed by. The
-    /// module list is fixed once the process is running, so it is read once.
-    u64 ModuleBaseFor(Kernel::KThread* thread, u64 pc) {
-        if (!modules_read) {
-            modules_read = true;
-            if (auto* process = thread->GetOwnerProcess()) {
-                modules = FindModules(process);
-                // Now that the loader has placed everything, tell each image
-                // where its own module went.
-                if (const auto setter = g_recomp_base_setter.load(std::memory_order_acquire)) {
-                    // modules is keyed by base, so iteration is load order.
-                    size_t index = 0;
-                    for (const auto& [module_base, name] : modules) {
-                        setter(index++, name.c_str(), module_base);
-                    }
+    /// Discover modules, publish their runtime bases and apply relocations as
+    /// one coordinated process-initialization step. Every CPU core calls this
+    /// gate before dispatch, but std::call_once makes the side effects happen
+    /// on exactly one core and publishes the completed module map to the rest.
+    void EnsureProcessInitialized(Kernel::KThread* thread) {
+        std::call_once(process_state->initialize_once, [this, thread] {
+            Kernel::KProcess* process = owner_process;
+            if (!process && thread) {
+                process = thread->GetOwnerProcess();
+            }
+            if (process) {
+                process_state->modules = FindModules(process);
+            }
+
+            // Now that the loader has placed everything, tell each image where
+            // its own module went. The map is keyed by base, so iteration is
+            // load order.
+            if (const auto setter = g_recomp_base_setter.load(std::memory_order_acquire)) {
+                size_t index = 0;
+                for (const auto& [module_base, name] : process_state->modules) {
+                    setter(index++, name.c_str(), module_base);
                 }
             }
-        }
-        u64 base = 0;
-        for (const auto& [module_base, name] : modules) {
-            if (pc >= module_base && module_base >= base) {
-                base = module_base;
-            }
-        }
-        return base;
+
+            ApplyAllRelocations(process_state->modules);
+        });
     }
 
     struct DynInfo {
@@ -483,9 +498,7 @@ struct ArmRecomp::Impl {
     GuestContextView ctx{};
     RecompHostMem bridge{};
     std::atomic<bool> interrupted{false};
-    Loader::AppLoader::Modules modules{};
-    bool modules_read{false};
-    bool rela_applied{false};
+    std::shared_ptr<ArmRecompProcessState> process_state;
     static constexpr size_t kTrail = 32;
     u64 trail[kTrail]{};
     size_t trail_pos{0};
@@ -503,9 +516,11 @@ struct ArmRecomp::Impl {
 };
 
 ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
+                     std::shared_ptr<ArmRecompProcessState> process_state,
                      Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
                      std::size_t core_index)
-    : ArmInterface{uses_wall_clock}, impl{std::make_unique<Impl>(system, lookup)} {
+    : ArmInterface{uses_wall_clock},
+      impl{std::make_unique<Impl>(system, lookup, std::move(process_state))} {
     impl->owner_process = process;
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;
@@ -566,30 +581,15 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     // Logged once so it is obvious from a log whether the backend was ever
     // entered at all. A run with no errors is otherwise indistinguishable from
     // a run where the guest thread was never scheduled onto it.
-    static bool announced = false;
-    if (!announced) {
-        announced = true;
+    std::call_once(impl->process_state->announce_once, [this] {
         LOG_INFO(Core_ARM, "ArmRecomp::RunThread entered, pc={:#x}", impl->ctx.pc);
-    }
+    });
     if (!impl->lookup) {
         LOG_ERROR(Core_ARM, "No recompiled code registered; cannot run thread");
         return HaltReason::BreakLoop;
     }
 
-    // Registering every loaded image's base with the host dispatcher is a
-    // side effect of this call, not something its return value is used for
-    // here - the dispatcher needs it done once before the first lookup, or
-    // every image's base stays 0 and every lookup misses.
-    static bool bases_registered = false;
-    if (!bases_registered) {
-        bases_registered = true;
-        impl->ModuleBaseFor(thread, impl->ctx.pc);
-    }
-
-    if (!impl->rela_applied) {
-        impl->rela_applied = true;
-        impl->ApplyAllRelocations(impl->modules);
-    }
+    impl->EnsureProcessInitialized(thread);
 
     // A previous miss handed this thread to the JIT; keep running there until
     // the PC lands back inside recompiled code. The trap sentinel has to be
@@ -694,7 +694,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             LOG_ERROR(Core_ARM, "recomp regs x0={:#x} x15={:#x} x18={:#x} x19={:#x}",
                       impl->ctx.x[0], impl->ctx.x[15], impl->ctx.x[18], impl->ctx.x[19]);
             {
-                const u64 mbase = impl->modules.empty() ? 0 : impl->modules.begin()->first;
+                const auto& modules = impl->process_state->modules;
+                const u64 mbase = modules.empty() ? 0 : modules.begin()->first;
                 for (u64 seg : {0x0ULL, 0x2000ULL, 0x3000ULL}) {
                     std::string dump;
                     for (u64 i = 0; i < 0x40; i += 4) {
@@ -769,6 +770,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     if (!impl->lookup) {
         return HaltReason::BreakLoop;
     }
+    impl->EnsureProcessInitialized(thread);
     const RecompBlockFn block = impl->lookup(impl->ctx.pc);
     if (!block) {
         return HaltReason::PrefetchAbort;

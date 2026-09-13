@@ -1320,13 +1320,14 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
     if (const auto recomp_lookup = this->IsApplication() ? Core::GetRecompLookup() : nullptr) {
         LOG_INFO(Kernel, "Using ArmRecomp for process '{}' (is_app={})", this->GetName(),
                  this->IsApplication());
+        m_arm_recomp_state = Core::CreateArmRecompProcessState();
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             // The exclusive monitor and process are handed over so ArmRecomp can
             // build a dynarmic fallback on demand: statically recompiled images
             // never cover every indirect call target, and without a fallback the
             // first uncovered PC hangs the thread for good.
             m_arm_interfaces[i] = std::make_unique<Core::ArmRecomp>(
-                kernel.System(), kernel.IsMulticore(), recomp_lookup, this,
+                kernel.System(), kernel.IsMulticore(), recomp_lookup, m_arm_recomp_state, this,
                 &static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
         }
         return;
