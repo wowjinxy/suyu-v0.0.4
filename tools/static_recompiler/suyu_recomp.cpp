@@ -5,6 +5,7 @@
 #include "core/recompiler/npdm_info.h"
 #include "core/recompiler/nso_dynamic.h"
 #include "core/recompiler/nso_image.h"
+#include "core/recompiler/nso_relocations.h"
 #include "core/recompiler/nso_symbols.h"
 #include "nso_sha256.h"
 
@@ -541,6 +542,16 @@ struct DynamicSymbolSummary {
     std::size_t absolute_definitions{};
 };
 
+struct RelocationPlanSummary {
+    std::size_t writes{};
+    std::size_t relative{};
+    std::size_t null_symbols{};
+    std::size_t module_definitions{};
+    std::size_t absolute_definitions{};
+    std::size_t external_definitions{};
+    std::size_t undefined_weak{};
+};
+
 DynamicSymbolSummary SummarizeDynamicSymbols(const suyu::recomp::NsoDynamicSymbolInfo& info) {
     DynamicSymbolSummary summary{.entries = info.symbols.size()};
     for (const suyu::recomp::NsoDynamicSymbol& symbol : info.symbols) {
@@ -555,6 +566,33 @@ DynamicSymbolSummary SummarizeDynamicSymbols(const suyu::recomp::NsoDynamicSymbo
         }
         if (symbol.IsAbsolute() && !symbol.name.empty()) {
             ++summary.absolute_definitions;
+        }
+    }
+    return summary;
+}
+
+RelocationPlanSummary SummarizeRelocationPlan(const suyu::recomp::NsoRelocationPlan& plan) {
+    RelocationPlanSummary summary{.writes = plan.writes.size()};
+    for (const suyu::recomp::NsoPlannedRelocation& write : plan.writes) {
+        switch (write.value_source) {
+        case suyu::recomp::NsoRelocationValueSource::Relative:
+            ++summary.relative;
+            break;
+        case suyu::recomp::NsoRelocationValueSource::NullSymbol:
+            ++summary.null_symbols;
+            break;
+        case suyu::recomp::NsoRelocationValueSource::ModuleDefinition:
+            ++summary.module_definitions;
+            break;
+        case suyu::recomp::NsoRelocationValueSource::AbsoluteDefinition:
+            ++summary.absolute_definitions;
+            break;
+        case suyu::recomp::NsoRelocationValueSource::ExternalDefinition:
+            ++summary.external_definitions;
+            break;
+        case suyu::recomp::NsoRelocationValueSource::UndefinedWeak:
+            ++summary.undefined_weak;
+            break;
         }
     }
     return summary;
@@ -700,8 +738,10 @@ int InspectNso(const Options& options) {
 
     std::optional<suyu::recomp::NsoDynamicInfo> dynamic_info;
     std::optional<DynamicSymbolSummary> dynamic_symbol_summary;
+    std::optional<RelocationPlanSummary> relocation_plan_summary;
     std::string dynamic_error;
     std::string dynamic_symbol_error;
+    std::string relocation_plan_error;
     if (analyze_aarch64) {
         if (!decoded) {
             dynamic_error = decoded.error;
@@ -719,8 +759,17 @@ int InspectNso(const Options& options) {
         auto symbols = suyu::recomp::ParseNsoDynamicSymbols(*decoded.image, *dynamic_info);
         if (symbols) {
             dynamic_symbol_summary = SummarizeDynamicSymbols(*symbols.info);
+            auto plan =
+                suyu::recomp::PlanNsoRelocations(*decoded.image, *dynamic_info, *symbols.info, 0);
+            if (plan) {
+                relocation_plan_summary = SummarizeRelocationPlan(*plan.plan);
+            } else {
+                relocation_plan_error = std::move(plan.error);
+            }
         } else {
             dynamic_symbol_error = std::move(symbols.error);
+            relocation_plan_error =
+                "dynamic symbol analysis is unavailable: " + dynamic_symbol_error;
         }
     }
 
@@ -852,6 +901,19 @@ int InspectNso(const Options& options) {
                               << " relocation-indices=verified\n";
                 } else {
                     std::cout << "ELF64 symbol analysis: unavailable (" << dynamic_symbol_error
+                              << ")\n";
+                }
+                if (relocation_plan_summary) {
+                    std::cout
+                        << "ELF64 relocation plan: writes=" << relocation_plan_summary->writes
+                        << " relative=" << relocation_plan_summary->relative
+                        << " null-symbol=" << relocation_plan_summary->null_symbols
+                        << " module-definitions=" << relocation_plan_summary->module_definitions
+                        << " absolute-definitions=" << relocation_plan_summary->absolute_definitions
+                        << " external-definitions=" << relocation_plan_summary->external_definitions
+                        << " undefined-weak=" << relocation_plan_summary->undefined_weak << '\n';
+                } else {
+                    std::cout << "ELF64 relocation plan: unavailable (" << relocation_plan_error
                               << ")\n";
                 }
             } else {
@@ -992,6 +1054,20 @@ int InspectNso(const Options& options) {
                       << ", \"relocation_indices_verified\": true}";
         } else {
             std::cout << "{\"error\": \"" << JsonEscape(dynamic_symbol_error) << "\"}";
+        }
+        std::cout << ", \"relocation_plan\": ";
+        if (relocation_plan_summary) {
+            std::cout << "{\"writes\": " << relocation_plan_summary->writes
+                      << ", \"relative\": " << relocation_plan_summary->relative
+                      << ", \"null_symbols\": " << relocation_plan_summary->null_symbols
+                      << ", \"module_definitions\": " << relocation_plan_summary->module_definitions
+                      << ", \"absolute_definitions\": "
+                      << relocation_plan_summary->absolute_definitions
+                      << ", \"external_definitions\": "
+                      << relocation_plan_summary->external_definitions
+                      << ", \"undefined_weak\": " << relocation_plan_summary->undefined_weak << '}';
+        } else {
+            std::cout << "{\"error\": \"" << JsonEscape(relocation_plan_error) << "\"}";
         }
         std::cout << ", \"rela\": ";
         print_optional_table(dynamic_info->rela);

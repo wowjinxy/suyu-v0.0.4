@@ -100,7 +100,8 @@ foreach(EXPECTED
         "Dynamic symbols: address=0x6180 entry-size=24"
         "Dynamic RELA: address=0x6100 bytes=24 entries=1 entry-size=24"
         "PLT RELA: address=0x6118 bytes=24 entries=1 entry-size=24"
-        "ELF64 symbols: entries=4 imports=1 weak-imports=1 exports=2 absolute-definitions=1 relocation-indices=verified")
+        "ELF64 symbols: entries=4 imports=1 weak-imports=1 exports=2 absolute-definitions=1 relocation-indices=verified"
+        "ELF64 relocation plan: writes=2 relative=1 null-symbol=0 module-definitions=0 absolute-definitions=0 external-definitions=0 undefined-weak=1")
     string(FIND "${DYNAMIC_INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
     if(EXPECTED_POSITION EQUAL -1)
         message(FATAL_ERROR
@@ -136,6 +137,22 @@ string(JSON DYNAMIC_ABSOLUTE_DEFINITIONS GET "${DYNAMIC_JSON_OUTPUT}"
        dynamic_analysis symbol_analysis absolute_definitions)
 string(JSON DYNAMIC_RELOCATION_INDICES GET "${DYNAMIC_JSON_OUTPUT}"
        dynamic_analysis symbol_analysis relocation_indices_verified)
+string(JSON DYNAMIC_RELOCATION_PLAN_TYPE TYPE "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan)
+string(JSON DYNAMIC_RELOCATION_WRITES GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan writes)
+string(JSON DYNAMIC_RELOCATION_RELATIVE GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan relative)
+string(JSON DYNAMIC_RELOCATION_NULL_SYMBOLS GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan null_symbols)
+string(JSON DYNAMIC_RELOCATION_MODULE_DEFINITIONS GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan module_definitions)
+string(JSON DYNAMIC_RELOCATION_ABSOLUTE_DEFINITIONS GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan absolute_definitions)
+string(JSON DYNAMIC_RELOCATION_EXTERNAL_DEFINITIONS GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan external_definitions)
+string(JSON DYNAMIC_RELOCATION_UNDEFINED_WEAK GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis relocation_plan undefined_weak)
 if(NOT DYNAMIC_ANALYSIS_TYPE STREQUAL "OBJECT" OR
    NOT DYNAMIC_FORMAT STREQUAL "ELF64" OR
    NOT DYNAMIC_MOD0 STREQUAL "0x6000" OR
@@ -146,7 +163,15 @@ if(NOT DYNAMIC_ANALYSIS_TYPE STREQUAL "OBJECT" OR
    NOT DYNAMIC_SYMBOL_ENTRIES EQUAL 4 OR
    NOT DYNAMIC_WEAK_IMPORTS EQUAL 1 OR
    NOT DYNAMIC_ABSOLUTE_DEFINITIONS EQUAL 1 OR
-   NOT DYNAMIC_RELOCATION_INDICES)
+   NOT DYNAMIC_RELOCATION_INDICES OR
+   NOT DYNAMIC_RELOCATION_PLAN_TYPE STREQUAL "OBJECT" OR
+   NOT DYNAMIC_RELOCATION_WRITES EQUAL 2 OR
+   NOT DYNAMIC_RELOCATION_RELATIVE EQUAL 1 OR
+   NOT DYNAMIC_RELOCATION_NULL_SYMBOLS EQUAL 0 OR
+   NOT DYNAMIC_RELOCATION_MODULE_DEFINITIONS EQUAL 0 OR
+   NOT DYNAMIC_RELOCATION_ABSOLUTE_DEFINITIONS EQUAL 0 OR
+   NOT DYNAMIC_RELOCATION_EXTERNAL_DEFINITIONS EQUAL 0 OR
+   NOT DYNAMIC_RELOCATION_UNDEFINED_WEAK EQUAL 1)
     message(FATAL_ERROR "Dynamic JSON schema is invalid:\n${DYNAMIC_JSON_OUTPUT}")
 endif()
 
