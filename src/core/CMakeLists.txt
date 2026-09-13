@@ -21,6 +21,8 @@ add_library(core STATIC
     recompiler/nso_dynamic.h
     recompiler/nso_image.cpp
     recompiler/nso_image.h
+    recompiler/nso_relocation_transaction.cpp
+    recompiler/nso_relocation_transaction.h
     recompiler/nso_relocations.cpp
     recompiler/nso_relocations.h
     recompiler/nso_symbols.cpp
