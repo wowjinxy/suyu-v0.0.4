@@ -3814,13 +3814,23 @@ void GMainWindow::OnExportRecompiledSource(const QString& output_dir, bool sourc
     auto* future_watcher = new QFutureWatcher<suyu::recomp::RecompileStats>(this);
     connect(future_watcher, &QFutureWatcher<suyu::recomp::RecompileStats>::finished, this,
             [this, future_watcher, output_dir]() {
-                const auto stats = future_watcher->result();
-                QMessageBox::information(
-                    this, tr("Recompile Export"),
-                    tr("Exported %1 blocks (%2 instructions) to:\n%3")
-                        .arg(static_cast<int>(stats.blocks))
-                        .arg(static_cast<int>(stats.instructions))
-                        .arg(output_dir));
+                try {
+                    const auto stats = future_watcher->result();
+                    QMessageBox::information(
+                        this, tr("Recompile Export"),
+                        tr("Exported %1 blocks (%2 instructions) to:\n%3")
+                            .arg(static_cast<int>(stats.blocks))
+                            .arg(static_cast<int>(stats.instructions))
+                            .arg(output_dir));
+                } catch (const std::exception& error) {
+                    QMessageBox::critical(
+                        this, tr("Recompile Export Failed"),
+                        tr("The recompiler could not write the export:\n%1")
+                            .arg(QString::fromUtf8(error.what())));
+                } catch (...) {
+                    QMessageBox::critical(this, tr("Recompile Export Failed"),
+                                          tr("The recompiler could not write the export."));
+                }
                 future_watcher->deleteLater();
             });
 

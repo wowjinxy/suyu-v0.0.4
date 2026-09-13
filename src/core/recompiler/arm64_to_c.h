@@ -19,7 +19,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1783,6 +1785,62 @@ inline size_t FuncNameTo(char (&b)[64], const char* mod, u64 v) {
     return (size_t)snprintf(b, sizeof b, "blk_%s_%016llx", mod, (unsigned long long)v);
 }
 
+// Encode arbitrary UTF-8 bytes as one C string literal. Octal escapes are used for bytes outside
+// printable ASCII because, unlike \x escapes, exactly three octal digits cannot consume a
+// following hexadecimal character. This keeps ROM titles containing quotes, newlines, or
+// non-ASCII characters from producing invalid generated source.
+inline std::string EscapeCString(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    char octal[5];
+    for (const unsigned char ch : value) {
+        switch (ch) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        case '?':
+            // Generated projects target C11, where ??/ is a trigraph for a backslash and can
+            // turn the following byte into an escape sequence before the compiler sees it.
+            escaped += "\\077";
+            break;
+        default:
+            if (ch >= 0x20 && ch <= 0x7E) {
+                escaped += static_cast<char>(ch);
+            } else {
+                snprintf(octal, sizeof octal, "\\%03o", static_cast<unsigned>(ch));
+                escaped += octal;
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+inline bool IsModuleIdentifier(std::string_view value) {
+    if (value.empty() || value.size() > 32) {
+        return false;
+    }
+    for (const unsigned char ch : value) {
+        if ((ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') &&
+            (ch < '0' || ch > '9') && ch != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
 const char* RuntimeH();
 const char* RuntimeC();
 
@@ -1818,6 +1876,39 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                                   // block discovery seeds a root at each even when nothing in
                                   // this module's own .text branches there directly.
                                   const std::vector<u64>* extra_roots = nullptr) {
+    (void)source_only; // Kept in the public API for compatibility; this function only emits files.
+    if (!IsModuleIdentifier(mod)) {
+        throw std::invalid_argument(
+            "module must contain 1-32 ASCII letters, digits, or underscores");
+    }
+    if (!text || n_bytes == 0 || (n_bytes & 3) != 0) {
+        throw std::invalid_argument("text must be non-empty and a multiple of four bytes");
+    }
+    if (n_bytes / 4 > std::numeric_limits<u32>::max() ||
+        n_bytes > std::numeric_limits<u64>::max() - base) {
+        throw std::invalid_argument("text address range is too large");
+    }
+    if (out_dir.empty()) {
+        throw std::invalid_argument("output directory must not be empty");
+    }
+    const auto max_stream_size = static_cast<size_t>(std::numeric_limits<std::streamsize>::max());
+    if (n_bytes > max_stream_size || rodata_size > max_stream_size || data_size > max_stream_size) {
+        throw std::invalid_argument("a segment is too large to emit on this host");
+    }
+    if ((!rodata && rodata_size != 0) || (!data_seg && data_size != 0)) {
+        throw std::invalid_argument("a segment size was provided without segment data");
+    }
+    const u64 text_end = base + static_cast<u64>(n_bytes);
+    if (entry_pc != 0 && ((entry_pc & 3) != 0 || entry_pc < base || entry_pc >= text_end)) {
+        throw std::invalid_argument("entry PC must be aligned and inside text");
+    }
+    if (extra_roots) {
+        for (const u64 root : *extra_roots) {
+            if ((root & 3) != 0 || root < base || root >= text_end) {
+                throw std::invalid_argument("every extra root must be aligned and inside text");
+            }
+        }
+    }
     RecompileStats stats;
     auto blocks = DiscoverBlocks(text, n_bytes, base, entry_pc, extra_roots);
     const u32* p = reinterpret_cast<const u32*>(text);
@@ -1840,6 +1931,10 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     const auto make_dir = [](const std::string& dir) {
         std::error_code ec;
         std::filesystem::create_directories(Utf8Path(dir), ec);
+        if (ec) {
+            throw std::runtime_error("could not create output directory '" + dir + "': " +
+                                     ec.message());
+        }
     };
     make_dir(out_dir);
     // Every generated translation unit lands here, keeping the module root down
@@ -1851,12 +1946,18 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     for (size_t u = 0; u < unit_count; ++u) {
         units.emplace_back(Utf8Path(src_dir + "/recompiled_" + mod + "_" + std::to_string(u) + ".c"),
                            std::ios::binary);
+        if (!units.back()) {
+            throw std::runtime_error("could not open generated translation unit for writing");
+        }
         units.back() << "/* auto-generated by suyu static recompiler - DO NOT EDIT */\n"
                         "#include \"recomp_runtime.h\"\n"
                         "#include <stdint.h>\n"
                         "#include <string.h>\n"   // memcpy, used by the scalar FP paths
                         "#include <math.h>\n"
                         "struct _recomp_ent{uint64_t va; BlockFn fn;};\n\n";
+        if (!units.back()) {
+            throw std::runtime_error("could not write generated translation unit header");
+        }
     }
 
     // Each unit accumulates into a string and is written out in large blocks.
@@ -1873,6 +1974,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     const auto flush_unit = [&](size_t u, bool force) {
         if (rcu.size() >= kUnitFlushBytes || (force && !rcu.empty())) {
             units[u].write(rcu.data(), (std::streamsize)rcu.size());
+            if (!units[u]) {
+                throw std::runtime_error("could not write generated translation unit");
+            }
             rcu.clear();
         }
     };
@@ -2012,7 +2116,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "    return (lo<n && t[lo].va==pc)?t[lo].fn:0;\n"
           "  }\n}\n";
 
-    const std::string title_str = display_title.empty() ? mod : display_title;
+    const std::string title_str = EscapeCString(display_title.empty() ? mod : display_title);
     std::ostringstream mc;
     mc << "#include \"recomp_runtime.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n";
     mc << "#ifdef HAVE_SDL2\n#include <SDL2/SDL.h>\n#endif\n\n";
@@ -2044,6 +2148,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "    if(e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_ESCAPE) return 0;\n";
     mc << "  }\n  return 1;\n}\n#endif /* HAVE_SDL2 */\n\n";
     mc << "int main(int argc, char** argv){\n";
+    mc << "  int use_save=1;\n";
+    mc << "  for(int i=1;i<argc;++i) if(strcmp(argv[i],\"--no-save\")==0) use_save=0;\n";
     mc << "  printf(\"=== %s ===\\n\", kGameTitle);\n\n";
     mc << "#ifdef HAVE_SDL2\n";
     mc << "  if(SDL_Init(SDL_INIT_VIDEO) == 0) {\n";
@@ -2063,13 +2169,13 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "  c.heap_cur=c.heap_base; c.heap_end=c.mem_base_vaddr+GUEST_MEM_SIZE;\n";
     mc << "  c.x[31]=c.mem_base_vaddr + GUEST_MEM_SIZE - 16; /* SP */\n";
     mc << "  c.pc=0x" << std::hex << (entry_pc ? entry_pc : base) << std::dec << "ULL;\n\n";
-    mc << "  recomp_save_init(&c, argv[0]);\n\n";
+    mc << "  if(use_save) recomp_save_init(&c, argv[0]);\n\n";
     mc << "  { char data_dir[512];\n";
     mc << "    snprintf(data_dir,sizeof data_dir,\"%s\",argv[0]);\n";
     mc << "    char* sl=strrchr(data_dir,'\\\\'); if(!sl) sl=strrchr(data_dir,'/'); if(sl) *(sl+1)=0; else data_dir[0]=0;\n";
     mc << "    strncat(data_dir,\"data\",sizeof(data_dir)-strlen(data_dir)-1);\n";
     mc << "    recomp_load_segments(&c,data_dir);\n  }\n\n";
-    mc << "  { uint64_t sz=0;\n";
+    mc << "  if(use_save) { uint64_t sz=0;\n";
     mc << "    if(recomp_save_exists(&c,\"autosave.bin\")){\n";
     mc << "      recomp_save_read(&c,\"autosave.bin\",c.mem,(uint64_t)GUEST_MEM_SIZE,&sz);\n";
     mc << "      printf(\"[recomp] Restored autosave (%llu bytes)\\n\",(unsigned long long)sz);\n";
@@ -2084,7 +2190,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "#else\n";
     mc << "  recomp_run(&c);\n";
     mc << "#endif\n\n";
-    mc << "  recomp_save_write(&c,\"autosave.bin\",c.mem,(uint64_t)GUEST_MEM_SIZE);\n";
+    mc << "  if(use_save) recomp_save_write(&c,\"autosave.bin\",c.mem,(uint64_t)GUEST_MEM_SIZE);\n";
     mc << "  printf(\"[recomp] halted at pc=0x%llx\\n\",(unsigned long long)c.pc);\n";
     mc << "#ifdef HAVE_SDL2\n";
     mc << "  if(g_sdl_texture)  SDL_DestroyTexture(g_sdl_texture);\n";
@@ -2108,6 +2214,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "endif()\n"
        << "set(CMAKE_C_STANDARD 11)\n"
        << "include_directories(${CMAKE_CURRENT_SOURCE_DIR})\n"
+       << "if(NOT WIN32)\n"
+       << "  set(RECOMP_PLATFORM_LIBS m)\n"
+       << "endif()\n"
        << "# A host project (suyu) may apply C++ flags to every language; this\n"
        << "# directory is plain C, and MSVC rejects /std:c11 together with\n"
        << "# /std:c++20 outright.\n"
@@ -2162,10 +2271,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "endif()\n\n"
        << "if(NOT RECOMP_STATIC_ONLY)\n"
        << "add_executable(recompiled main.c recomp_runtime.c ${RECOMP_SOURCES})\n"
+       << "target_link_libraries(recompiled PRIVATE ${RECOMP_PLATFORM_LIBS})\n"
+       << "add_custom_command(TARGET recompiled POST_BUILD\n"
+       << "  COMMAND ${CMAKE_COMMAND} -E remove -f\n"
+       << "          $<TARGET_FILE_DIR:recompiled>/data/rodata.bin\n"
+       << "          $<TARGET_FILE_DIR:recompiled>/data/data.bin\n"
+       << "  COMMAND ${CMAKE_COMMAND} -E copy_directory\n"
+       << "          ${CMAKE_CURRENT_SOURCE_DIR}/data\n"
+       << "          $<TARGET_FILE_DIR:recompiled>/data\n"
+       << "  VERBATIM)\n"
        << "if(SDL2_FOUND)\n"
        << "  target_compile_definitions(recompiled PRIVATE HAVE_SDL2)\n"
        << "  target_include_directories(recompiled PRIVATE ${SDL2_INCLUDE_DIRS})\n"
-       << "  target_link_libraries(recompiled ${SDL2_LIBRARIES})\n"
+       << "  target_link_libraries(recompiled PRIVATE ${SDL2_LIBRARIES})\n"
        << "  message(STATUS \"SDL2 found — recompiled will open a game window\")\n"
        << "else()\n"
        << "  message(STATUS \"SDL2 not found — running headless (no window)\")\n"
@@ -2187,6 +2305,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     cm << "if(NOT RECOMP_STATIC_ONLY)\n"
        << "add_library(" << dll_target << " SHARED recomp_export.c recomp_runtime.c "
           "${RECOMP_SOURCES})\n"
+       << "target_link_libraries(" << dll_target << " PRIVATE ${RECOMP_PLATFORM_LIBS})\n"
        << "set_target_properties(" << dll_target << " PROPERTIES C_VISIBILITY_PRESET hidden "
           "OUTPUT_NAME \"" << dll_target << "\")\n"
        << "target_compile_definitions(" << dll_target
@@ -2214,7 +2333,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "add_library(" << static_target << " STATIC recomp_export.c ${RECOMP_SOURCES})\n"
        << "target_include_directories(" << static_target
        << " PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})\n"
-       << "target_link_libraries(" << static_target << " PUBLIC recomp_runtime_shared)\n"
+       << "target_link_libraries(" << static_target
+       << " PUBLIC recomp_runtime_shared ${RECOMP_PLATFORM_LIBS})\n"
        << "target_compile_definitions(" << static_target
        << " PRIVATE SUYU_HOSTED_RECOMP=1 RECOMP_STATIC_MODULE=1"
        << " g_module_base=g_module_base_" << mod
@@ -2252,8 +2372,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << std::hex << (entry_pc ? entry_pc : base) << std::dec << "ULL; }\n";
 
     auto write = [&](const std::string& name, const std::string& data) {
-        std::ofstream o(Utf8Path(out_dir + "/" + name), std::ios::binary);
+        const std::string path = out_dir + "/" + name;
+        std::ofstream o(Utf8Path(path), std::ios::binary);
+        if (!o) {
+            throw std::runtime_error("could not open generated file '" + path + "'");
+        }
         o.write(data.data(), (std::streamsize)data.size());
+        if (!o) {
+            throw std::runtime_error("could not write generated file '" + path + "'");
+        }
+        o.close();
+        if (!o) {
+            throw std::runtime_error("could not close generated file '" + path + "'");
+        }
     };
     write("recomp_runtime.h", RuntimeH());
     write("recomp_runtime.c", RuntimeC());
@@ -2264,7 +2395,13 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     // sure everything has reached disk.
     for (auto& u : units) {
         u.flush();
+        if (!u) {
+            throw std::runtime_error("could not flush generated translation unit");
+        }
         u.close();
+        if (!u) {
+            throw std::runtime_error("could not close generated translation unit");
+        }
     }
     write("main.c", mc.str());
     write("recomp_export.c", ex.str());
@@ -2276,16 +2413,63 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         make_dir(data_subdir);
         // Always write text.bin
         {
-            std::ofstream o(Utf8Path(data_subdir + "/text.bin"), std::ios::binary);
+            const std::string path = data_subdir + "/text.bin";
+            std::ofstream o(Utf8Path(path), std::ios::binary);
+            if (!o) {
+                throw std::runtime_error("could not open generated file '" + path + "'");
+            }
             o.write(reinterpret_cast<const char*>(text), (std::streamsize)n_bytes);
+            if (!o) {
+                throw std::runtime_error("could not write generated file '" + path + "'");
+            }
+            o.close();
+            if (!o) {
+                throw std::runtime_error("could not close generated file '" + path + "'");
+            }
         }
         if (rodata && rodata_size > 0) {
-            std::ofstream o(Utf8Path(data_subdir + "/rodata.bin"), std::ios::binary);
+            const std::string path = data_subdir + "/rodata.bin";
+            std::ofstream o(Utf8Path(path), std::ios::binary);
+            if (!o) {
+                throw std::runtime_error("could not open generated file '" + path + "'");
+            }
             o.write(reinterpret_cast<const char*>(rodata), (std::streamsize)rodata_size);
+            if (!o) {
+                throw std::runtime_error("could not write generated file '" + path + "'");
+            }
+            o.close();
+            if (!o) {
+                throw std::runtime_error("could not close generated file '" + path + "'");
+            }
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(Utf8Path(data_subdir + "/rodata.bin"), ec);
+            if (ec) {
+                throw std::runtime_error("could not remove stale generated rodata segment: " +
+                                         ec.message());
+            }
         }
         if (data_seg && data_size > 0) {
-            std::ofstream o(Utf8Path(data_subdir + "/data.bin"), std::ios::binary);
+            const std::string path = data_subdir + "/data.bin";
+            std::ofstream o(Utf8Path(path), std::ios::binary);
+            if (!o) {
+                throw std::runtime_error("could not open generated file '" + path + "'");
+            }
             o.write(reinterpret_cast<const char*>(data_seg), (std::streamsize)data_size);
+            if (!o) {
+                throw std::runtime_error("could not write generated file '" + path + "'");
+            }
+            o.close();
+            if (!o) {
+                throw std::runtime_error("could not close generated file '" + path + "'");
+            }
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(Utf8Path(data_subdir + "/data.bin"), ec);
+            if (ec) {
+                throw std::runtime_error("could not remove stale generated data segment: " +
+                                         ec.message());
+            }
         }
     }
 
@@ -2429,8 +2613,10 @@ inline const char* RuntimeC() {
 #endif
 
 static uint8_t* memptr(GuestContext* c, uint64_t va, uint64_t sz){
-  uint64_t off=va-c->mem_base_vaddr;
-  if(off+sz>c->mem_size) return 0;
+  uint64_t off;
+  if(va<c->mem_base_vaddr || sz>c->mem_size) return 0;
+  off=va-c->mem_base_vaddr;
+  if(off>c->mem_size-sz) return 0;
   return c->mem+off;
 }
 
@@ -2678,8 +2864,9 @@ void recomp_svc(GuestContext* c,unsigned imm){
     }
     break;
   default:
-    printf("[recomp] Unhandled SVC #0x%x x0=0x%llx x1=0x%llx\n",imm,
-      (unsigned long long)c->x[0],(unsigned long long)c->x[1]);
+    printf("[recomp] Unhandled SVC #0x%x x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx\n",imm,
+      (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+      (unsigned long long)c->x[2],(unsigned long long)c->x[3]);
     c->x[0]=0;
     break;
   }
@@ -2740,9 +2927,9 @@ void recomp_run(GuestContext* c){
   uint64_t g=0;
   while(!c->halted){
     BlockFn f=recomp_lookup(c->pc);
-    if(!f){ fprintf(stderr,"[recomp] no block at 0x%llx\n",(unsigned long long)c->pc); break;}
+    if(!f){ fprintf(stderr,"[recomp] no block at 0x%llx\n",(unsigned long long)c->pc); c->halted=1; break;}
     f(c);
-    if(++g>100000000ULL){ fprintf(stderr,"[recomp] watchdog (100M iterations)\n"); break; }
+    if(++g>100000000ULL){ fprintf(stderr,"[recomp] watchdog (100M iterations)\n"); c->halted=1; break; }
     /* Yield every 4096 blocks to prevent 100% CPU spin on tight loops */
     if((g & 0xFFF)==0){
 #ifdef _WIN32
