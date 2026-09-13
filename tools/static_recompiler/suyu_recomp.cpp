@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/recompiler/arm64_to_c.h"
+#include "core/recompiler/nso_image.h"
 
+#include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
@@ -11,24 +14,37 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
 
+#ifdef SUYU_RECOMPILER_HAS_LZ4
+#include <lz4.h>
+#endif
+
 #ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+// clang-format off: shellapi.h requires declarations from windows.h.
 #include <windows.h>
 #include <shellapi.h>
+// clang-format on
 #endif
 
 namespace {
 
-using suyu::recomp::u8;
 using suyu::recomp::u64;
+using suyu::recomp::u8;
+
+enum class Command {
+    EmitRaw,
+    InspectNso,
+};
 
 struct Options {
+    Command command{Command::EmitRaw};
     std::filesystem::path text_path;
     std::filesystem::path output_path;
     std::string module = "main";
@@ -37,6 +53,8 @@ struct Options {
     std::optional<u64> entry;
     std::vector<u64> extra_roots;
     bool force = false;
+    bool json = false;
+    bool assume_aarch64 = false;
 };
 
 void PrintUsage(std::ostream& out, std::string_view executable) {
@@ -44,6 +62,7 @@ void PrintUsage(std::ostream& out, std::string_view executable) {
         << "Usage:\n"
         << "  " << executable
         << " emit-raw --input <text.bin> --base <address> --output <directory> [options]\n"
+        << "  " << executable << " inspect-nso --input <module.nso> [--json] [--assume-aarch64]\n"
         << "  " << executable
         << " <text.bin> <address> <directory> [--source-only]  (legacy form)\n\n"
         << "Required:\n"
@@ -56,9 +75,12 @@ void PrintUsage(std::ostream& out, std::string_view executable) {
         << "  --module <name>      C identifier fragment (defaults to main)\n"
         << "  --title <text>       Display title embedded in the standalone runner\n"
         << "  --force              Allow writing into a non-empty output directory\n"
+        << "  --json               Emit machine-readable inspect-nso output\n"
+        << "  --assume-aarch64     Analyze decoded text as AArch64 (NSO has no ISA field)\n"
         << "  -h, --help           Show this help\n\n"
-        << "This low-level tool accepts a decoded AArch64 text segment. NSP/XCI/NCA/NSO\n"
-        << "loading remains in suyu's game exporter. Generated standalone programs use\n"
+        << "inspect-nso accepts a plaintext NSO and never needs title keys. Recompilation\n"
+        << "still requires an architecture decision from main.npdm or an explicit assumption.\n"
+        << "Generated standalone programs use\n"
         << "stub services; real games require the hosted suyu ArmRecomp runtime.\n";
 }
 
@@ -89,8 +111,8 @@ bool IsModuleName(std::string_view name) {
         return false;
     }
     for (const unsigned char ch : name) {
-        if ((ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') &&
-            (ch < '0' || ch > '9') && ch != '_') {
+        if ((ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') &&
+            ch != '_') {
             return false;
         }
     }
@@ -119,9 +141,9 @@ std::optional<std::vector<std::string>> GetUtf8Arguments() {
             arguments.emplace_back();
             continue;
         }
-        const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(),
-                                             static_cast<int>(wide.size()), nullptr, 0, nullptr,
-                                             nullptr);
+        const int size =
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(),
+                                static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
         if (size <= 0) {
             conversion_failed = true;
             break;
@@ -166,9 +188,8 @@ std::optional<std::vector<u8>> ReadFile(const std::filesystem::path& path,
 
     std::vector<u8> bytes(static_cast<std::size_t>(size));
     stream.seekg(0);
-    if (!bytes.empty() &&
-        !stream.read(reinterpret_cast<char*>(bytes.data()),
-                     static_cast<std::streamsize>(bytes.size()))) {
+    if (!bytes.empty() && !stream.read(reinterpret_cast<char*>(bytes.data()),
+                                       static_cast<std::streamsize>(bytes.size()))) {
         std::cerr << "error: could not read all of " << description << ": " << PathToUtf8(path)
                   << '\n';
         return std::nullopt;
@@ -182,9 +203,13 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
     bool have_base = false;
     bool have_output = false;
 
-    const bool has_command = argc > 1 && std::string_view{argv[1]} == "emit-raw";
-    if (!has_command && argc >= 4 && !IsOption(argv[1]) && !IsOption(argv[2]) &&
-        !IsOption(argv[3])) {
+    const bool emit_raw_command = argc > 1 && std::string_view{argv[1]} == "emit-raw";
+    const bool inspect_nso_command = argc > 1 && std::string_view{argv[1]} == "inspect-nso";
+    if (inspect_nso_command) {
+        options.command = Command::InspectNso;
+    }
+    if (!emit_raw_command && !inspect_nso_command && argc >= 4 && !IsOption(argv[1]) &&
+        !IsOption(argv[2]) && !IsOption(argv[3])) {
         options.text_path = suyu::recomp::Utf8Path(argv[1]);
         const auto base = ParseAddress(argv[2]);
         if (!base) {
@@ -196,7 +221,7 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
         have_input = have_base = have_output = true;
     }
 
-    const int start = have_input ? 4 : (has_command ? 2 : 1);
+    const int start = have_input ? 4 : ((emit_raw_command || inspect_nso_command) ? 2 : 1);
     for (int i = start; i < argc; ++i) {
         const std::string_view argument = argv[i];
         const auto value_after = [&](std::string_view option) -> std::optional<std::string_view> {
@@ -220,7 +245,27 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             continue;
         }
         if (argument == "--force") {
+            if (options.command == Command::InspectNso) {
+                std::cerr << "error: --force is not valid for inspect-nso\n";
+                return std::nullopt;
+            }
             options.force = true;
+            continue;
+        }
+        if (argument == "--json") {
+            if (options.command != Command::InspectNso) {
+                std::cerr << "error: --json is only valid for inspect-nso\n";
+                return std::nullopt;
+            }
+            options.json = true;
+            continue;
+        }
+        if (argument == "--assume-aarch64") {
+            if (options.command != Command::InspectNso) {
+                std::cerr << "error: --assume-aarch64 is only valid for inspect-nso\n";
+                return std::nullopt;
+            }
+            options.assume_aarch64 = true;
             continue;
         }
         if (const auto value = value_after("--input")) {
@@ -230,6 +275,10 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
             options.text_path = suyu::recomp::Utf8Path(std::string{*value});
             have_input = true;
             continue;
+        }
+        if (options.command == Command::InspectNso) {
+            std::cerr << "error: unknown inspect-nso argument: " << argument << '\n';
+            return std::nullopt;
         }
         if (const auto value = value_after("--base")) {
             if (value->empty()) {
@@ -293,6 +342,14 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
         return std::nullopt;
     }
 
+    if (options.command == Command::InspectNso) {
+        if (!have_input) {
+            std::cerr << "error: inspect-nso requires --input\n";
+            return std::nullopt;
+        }
+        return options;
+    }
+
     if (!have_input || !have_base || !have_output) {
         std::cerr << "error: --input, --base, and --output are required\n";
         return std::nullopt;
@@ -309,6 +366,251 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
     return options;
 }
 
+std::string Hex(u64 value) {
+    constexpr char Digits[] = "0123456789abcdef";
+    std::string result;
+    do {
+        result.push_back(Digits[value & 0xF]);
+        value >>= 4;
+    } while (value != 0);
+    std::reverse(result.begin(), result.end());
+    return "0x" + result;
+}
+
+std::string JsonEscape(std::string_view value) {
+    constexpr char Digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size() + 8);
+    for (const unsigned char ch : value) {
+        switch (ch) {
+        case '\"':
+            result += "\\\"";
+            break;
+        case '\\':
+            result += "\\\\";
+            break;
+        case '\b':
+            result += "\\b";
+            break;
+        case '\f':
+            result += "\\f";
+            break;
+        case '\n':
+            result += "\\n";
+            break;
+        case '\r':
+            result += "\\r";
+            break;
+        case '\t':
+            result += "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                result += "\\u00";
+                result.push_back(Digits[ch >> 4]);
+                result.push_back(Digits[ch & 0xF]);
+            } else {
+                result.push_back(static_cast<char>(ch));
+            }
+        }
+    }
+    return result;
+}
+
+#ifdef SUYU_RECOMPILER_HAS_LZ4
+bool DecompressLz4(std::span<const std::uint8_t> source, std::span<std::uint8_t> destination) {
+    if (source.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        destination.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    const int size = LZ4_decompress_safe(
+        reinterpret_cast<const char*>(source.data()), reinterpret_cast<char*>(destination.data()),
+        static_cast<int>(source.size()), static_cast<int>(destination.size()));
+    return size == static_cast<int>(destination.size());
+}
+#endif
+
+int InspectNso(const Options& options) {
+    const auto bytes = ReadFile(options.text_path, "NSO image");
+    if (!bytes) {
+        return 1;
+    }
+
+    const auto inspection = suyu::recomp::InspectNso(*bytes);
+    if (!inspection) {
+        std::cerr << "error: invalid NSO image: " << inspection.error << '\n';
+        return 1;
+    }
+    const auto& info = *inspection.info;
+
+#ifdef SUYU_RECOMPILER_HAS_LZ4
+    const auto decoded = suyu::recomp::DecodeNso(*bytes, DecompressLz4);
+#else
+    const auto decoded = suyu::recomp::DecodeNso(*bytes);
+#endif
+    const bool decode_unavailable = !decoded && (info.uses_zbic ||
+#ifdef SUYU_RECOMPILER_HAS_LZ4
+                                                 false
+#else
+                                                 std::any_of(
+                                                     info.segments.begin(), info.segments.end(),
+                                                     [](const auto& segment) {
+                                                         return segment.compression ==
+                                                                suyu::recomp::NsoCompression::Lz4;
+                                                     })
+#endif
+                                                );
+    if (!decoded && !decode_unavailable) {
+        std::cerr << "error: NSO segment decoding failed: " << decoded.error << '\n';
+        return 1;
+    }
+    const auto& warnings = decoded.warnings;
+
+    std::optional<u64> aarch64_entry;
+    std::vector<suyu::recomp::Block> aarch64_blocks;
+    std::string aarch64_error;
+    if (options.assume_aarch64) {
+        if (!decoded) {
+            aarch64_error = decoded.error;
+        } else {
+            const auto& text = decoded.image->segments[0];
+            const u64 base = info.segments[0].memory_offset;
+            if (text.empty() || (text.size() & 3) != 0 || (base & 3) != 0) {
+                aarch64_error = "text must be non-empty, four-byte aligned, and word-sized";
+            } else {
+                aarch64_entry = base + suyu::recomp::FindNsoAarch64EntryOffset(text);
+                aarch64_blocks = suyu::recomp::DiscoverBlocks(text.data(), text.size(), base,
+                                                              *aarch64_entry, nullptr);
+            }
+        }
+    }
+
+    const std::string build_id = suyu::recomp::NsoBuildIdToHex(info.build_id);
+    if (!options.json) {
+        std::cout << "Input: " << PathToUtf8(options.text_path) << '\n'
+                  << "Format: NSO0\n"
+                  << "Version: " << info.version << '\n'
+                  << "Flags: " << Hex(info.flags) << '\n'
+                  << "Architecture: "
+                  << (options.assume_aarch64 ? "AArch64 (explicit assumption)"
+                                             : "unknown (main.npdm required)")
+                  << '\n'
+                  << "Build ID: " << build_id << '\n'
+                  << "Execute-only text: " << (info.execute_only ? "yes" : "no") << '\n'
+                  << "Segments:\n";
+        for (std::size_t i = 0; i < info.segments.size(); ++i) {
+            const auto& segment = info.segments[i];
+            std::cout << "  "
+                      << suyu::recomp::NsoSegmentName(static_cast<suyu::recomp::NsoSegmentId>(i))
+                      << ": file=" << Hex(segment.file_offset)
+                      << " memory=" << Hex(segment.memory_offset)
+                      << " decoded=" << segment.decoded_size << " stored=" << segment.stored_size
+                      << " compression=" << suyu::recomp::NsoCompressionName(segment.compression)
+                      << " hash-required=" << (segment.hash_required ? "yes" : "no");
+            if (segment.hash_required) {
+                std::cout << " expected-sha256="
+                          << suyu::recomp::NsoBuildIdToHex(segment.expected_hash);
+            }
+            std::cout << '\n';
+        }
+        std::cout << "Module name: offset=" << Hex(info.module_name_offset)
+                  << " size=" << info.module_name_size << '\n'
+                  << "BSS size: " << info.bss_size << '\n'
+                  << "Rodata extents: api-info=" << Hex(info.api_info.offset) << "+"
+                  << info.api_info.size << " dynstr=" << Hex(info.dynstr.offset) << "+"
+                  << info.dynstr.size << " dynsym=" << Hex(info.dynsym.offset) << "+"
+                  << info.dynsym.size << '\n';
+        if (decoded) {
+            std::cout << "Segments decoded: yes\n";
+            std::cout << "Required hashes verified: "
+                      << (decoded.image->required_hashes_verified ? "yes" : "no") << '\n';
+        } else {
+            std::cout << "Segments decoded: no (" << decoded.error << ")\n";
+            std::cout << "Required hashes verified: unavailable\n";
+        }
+        if (options.assume_aarch64) {
+            if (aarch64_error.empty()) {
+                std::cout << "AArch64 entry: " << Hex(*aarch64_entry) << '\n'
+                          << "AArch64 blocks: " << aarch64_blocks.size() << '\n'
+                          << "AArch64 instruction words: " << decoded.image->segments[0].size() / 4
+                          << '\n';
+            } else {
+                std::cout << "AArch64 analysis: unavailable (" << aarch64_error << ")\n";
+            }
+        }
+        for (const std::string& warning : warnings) {
+            std::cout << "Warning: " << warning << '\n';
+        }
+        return 0;
+    }
+
+    std::cout << "{\n"
+              << "  \"format\": \"NSO0\",\n"
+              << "  \"input\": \"" << JsonEscape(PathToUtf8(options.text_path)) << "\",\n"
+              << "  \"version\": " << info.version << ",\n"
+              << "  \"flags\": \"" << Hex(info.flags) << "\",\n"
+              << "  \"architecture\": " << (options.assume_aarch64 ? "\"aarch64-assumed\"" : "null")
+              << ",\n"
+              << "  \"build_id\": \"" << build_id << "\",\n"
+              << "  \"execute_only\": " << (info.execute_only ? "true" : "false") << ",\n"
+              << "  \"bss_size\": " << info.bss_size << ",\n"
+              << "  \"module_name\": {\"offset\": \"" << Hex(info.module_name_offset)
+              << "\", \"size\": " << info.module_name_size << "},\n"
+              << "  \"rodata_extents\": {\n"
+              << "    \"api_info\": {\"offset\": \"" << Hex(info.api_info.offset)
+              << "\", \"size\": " << info.api_info.size << "},\n"
+              << "    \"dynstr\": {\"offset\": \"" << Hex(info.dynstr.offset)
+              << "\", \"size\": " << info.dynstr.size << "},\n"
+              << "    \"dynsym\": {\"offset\": \"" << Hex(info.dynsym.offset)
+              << "\", \"size\": " << info.dynsym.size << "}\n"
+              << "  },\n"
+              << "  \"segments\": [\n";
+    for (std::size_t i = 0; i < info.segments.size(); ++i) {
+        const auto& segment = info.segments[i];
+        std::cout << "    {\"name\": \""
+                  << suyu::recomp::NsoSegmentName(static_cast<suyu::recomp::NsoSegmentId>(i))
+                  << "\", \"file_offset\": \"" << Hex(segment.file_offset)
+                  << "\", \"memory_offset\": \"" << Hex(segment.memory_offset)
+                  << "\", \"decoded_size\": " << segment.decoded_size
+                  << ", \"stored_size\": " << segment.stored_size << ", \"compression\": \""
+                  << suyu::recomp::NsoCompressionName(segment.compression)
+                  << "\", \"hash_required\": " << (segment.hash_required ? "true" : "false")
+                  << ", \"expected_sha256\": \""
+                  << suyu::recomp::NsoBuildIdToHex(segment.expected_hash) << "\"}"
+                  << (i + 1 == info.segments.size() ? "\n" : ",\n");
+    }
+    std::cout << "  ],\n"
+              << "  \"segments_decoded\": " << (decoded ? "true" : "false") << ",\n"
+              << "  \"required_hashes_verified\": ";
+    if (decoded) {
+        std::cout << (decoded.image->required_hashes_verified ? "true" : "false") << ",\n";
+    } else {
+        std::cout << "null,\n";
+    }
+    std::cout << "  \"decode_error\": ";
+    if (decoded) {
+        std::cout << "null,\n";
+    } else {
+        std::cout << "\"" << JsonEscape(decoded.error) << "\",\n";
+    }
+    std::cout << "  \"aarch64_analysis\": ";
+    if (!options.assume_aarch64) {
+        std::cout << "null,\n";
+    } else if (!aarch64_error.empty()) {
+        std::cout << "{\"error\": \"" << JsonEscape(aarch64_error) << "\"},\n";
+    } else {
+        std::cout << "{\"entry\": \"" << Hex(*aarch64_entry)
+                  << "\", \"blocks\": " << aarch64_blocks.size()
+                  << ", \"instruction_words\": " << decoded.image->segments[0].size() / 4 << "},\n";
+    }
+    std::cout << "  \"warnings\": [";
+    for (std::size_t i = 0; i < warnings.size(); ++i) {
+        std::cout << (i == 0 ? "" : ", ") << "\"" << JsonEscape(warnings[i]) << "\"";
+    }
+    std::cout << "]\n}\n";
+    return 0;
+}
+
 int Run(int argc, char** argv) {
     if (argc == 1) {
         PrintUsage(std::cerr, argv[0]);
@@ -321,6 +623,10 @@ int Run(int argc, char** argv) {
         return 2;
     }
     const Options& options = *parsed;
+
+    if (options.command == Command::InspectNso) {
+        return InspectNso(options);
+    }
 
     const auto text = ReadFile(options.text_path, "text segment");
     if (!text) {
@@ -383,15 +689,18 @@ int Run(int argc, char** argv) {
 
     try {
         const std::string output = PathToUtf8(options.output_path);
-        const auto stats = suyu::recomp::EmitProject(
-            options.module, text->data(), text->size(), options.base, output, true, nullptr, 0,
-            nullptr, 0, entry, options.title,
-            options.extra_roots.empty() ? nullptr : &options.extra_roots);
+        const auto stats =
+            suyu::recomp::EmitProject(options.module, text->data(), text->size(), options.base,
+                                      output, true, nullptr, 0, nullptr, 0, entry, options.title,
+                                      options.extra_roots.empty() ? nullptr : &options.extra_roots);
 
         const std::vector<std::filesystem::path> required_files{
-            "CMakeLists.txt",          "main.c",
-            "recomp_export.c",        "recomp_runtime.c",
-            "recomp_runtime.h",       "data/text.bin",
+            "CMakeLists.txt",
+            "main.c",
+            "recomp_export.c",
+            "recomp_runtime.c",
+            "recomp_runtime.h",
+            "data/text.bin",
             std::filesystem::path{"src"} / ("recompiled_" + options.module + ".c"),
             std::filesystem::path{"src"} / ("recompiled_" + options.module + "_0.c"),
         };
@@ -406,7 +715,8 @@ int Run(int argc, char** argv) {
 
         std::cout << "Generated " << stats.blocks << " blocks from " << stats.instructions
                   << " AArch64 instructions (" << stats.translated_terminators
-                  << " translated terminators).\nOutput: " << PathToUtf8(options.output_path) << '\n';
+                  << " translated terminators).\nOutput: " << PathToUtf8(options.output_path)
+                  << '\n';
     } catch (const std::exception& error) {
         std::cerr << "error: generation failed: " << error.what() << '\n';
         return 1;

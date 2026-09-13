@@ -1,0 +1,341 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "core/recompiler/nso_image.h"
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <new>
+#include <sstream>
+#include <stdexcept>
+
+namespace suyu::recomp {
+namespace {
+
+constexpr std::uint32_t KnownFlagsMask = 0xFF;
+
+std::uint32_t ReadU32(std::span<const std::uint8_t> bytes, std::size_t offset) {
+    return static_cast<std::uint32_t>(bytes[offset]) |
+           (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) |
+           (static_cast<std::uint32_t>(bytes[offset + 2]) << 16) |
+           (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+}
+
+bool RangeFits(std::uint64_t offset, std::uint64_t size, std::uint64_t limit) {
+    return offset <= limit && size <= limit - offset;
+}
+
+bool RangesOverlap(std::uint64_t first_offset, std::uint64_t first_size,
+                   std::uint64_t second_offset, std::uint64_t second_size) {
+    if (first_size == 0 || second_size == 0) {
+        return false;
+    }
+    return first_offset < second_offset + second_size && second_offset < first_offset + first_size;
+}
+
+std::string SegmentError(std::size_t index, const char* message) {
+    std::ostringstream out;
+    out << NsoSegmentName(static_cast<NsoSegmentId>(index)) << " segment " << message;
+    return out.str();
+}
+
+bool ValidateRoExtent(const NsoRelativeExtent& extent, std::uint32_t rodata_size, const char* name,
+                      std::string& error) {
+    if (extent.size == 0) {
+        return true;
+    }
+    if (!RangeFits(extent.offset, extent.size, rodata_size)) {
+        error = std::string{name} + " extent lies outside the decoded rodata segment";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+NsoInspection InspectNso(std::span<const std::uint8_t> file) {
+    NsoInspection result;
+    if (file.size() < NsoHeaderSize) {
+        result.error = "file is smaller than the 0x100-byte NSO0 header";
+        return result;
+    }
+    if (file[0] != 'N' || file[1] != 'S' || file[2] != 'O' || file[3] != '0') {
+        result.error = "invalid NSO0 magic";
+        return result;
+    }
+
+    NsoInfo info;
+    info.version = ReadU32(file, 0x04);
+    info.reserved = ReadU32(file, 0x08);
+    info.flags = ReadU32(file, 0x0C);
+    info.execute_only = (info.flags & (1U << 6)) != 0;
+    info.uses_zbic = (info.flags & (1U << 7)) != 0;
+    std::copy_n(file.begin() + 0x40, info.build_id.size(), info.build_id.begin());
+
+    info.module_name_offset = ReadU32(file, 0x1C);
+    info.module_name_size = ReadU32(file, 0x2C);
+    info.bss_size = ReadU32(file, 0x3C);
+    info.api_info = {ReadU32(file, 0x88), ReadU32(file, 0x8C)};
+    info.dynstr = {ReadU32(file, 0x90), ReadU32(file, 0x94)};
+    info.dynsym = {ReadU32(file, 0x98), ReadU32(file, 0x9C)};
+
+    for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+        const std::size_t header_offset = 0x10 + i * 0x10;
+        NsoSegmentInfo& segment = info.segments[i];
+        segment.file_offset = ReadU32(file, header_offset);
+        segment.memory_offset = ReadU32(file, header_offset + 4);
+        segment.decoded_size = ReadU32(file, header_offset + 8);
+        segment.extra = ReadU32(file, header_offset + 12);
+        segment.compressed_size_field = ReadU32(file, 0x60 + i * 4);
+        const bool compressed = (info.flags & (1U << i)) != 0;
+        segment.compression = compressed
+                                  ? (info.uses_zbic ? NsoCompression::Zbic : NsoCompression::Lz4)
+                                  : NsoCompression::None;
+        // The compressed-size fields are not authoritative for uncompressed segments.
+        segment.stored_size = compressed ? segment.compressed_size_field : segment.decoded_size;
+        segment.hash_required = (info.flags & (1U << (i + 3))) != 0;
+        std::copy_n(file.begin() + 0xA0 + i * 0x20, segment.expected_hash.size(),
+                    segment.expected_hash.begin());
+
+        if (segment.file_offset > file.size()) {
+            result.error = SegmentError(i, "file offset lies beyond the end of the file");
+            return result;
+        }
+        if (segment.decoded_size == 0 && segment.stored_size != 0) {
+            result.error = SegmentError(i, "has stored bytes but a zero decoded size");
+            return result;
+        }
+        if (segment.decoded_size != 0 && segment.stored_size == 0) {
+            result.error = SegmentError(i, "has a nonzero decoded size but no stored bytes");
+            return result;
+        }
+        if (segment.stored_size != 0) {
+            if (segment.file_offset < NsoHeaderSize) {
+                result.error = SegmentError(i, "overlaps the NSO0 header");
+                return result;
+            }
+            if (!RangeFits(segment.file_offset, segment.stored_size, file.size())) {
+                result.error = SegmentError(i, "extends beyond the end of the file");
+                return result;
+            }
+        }
+        constexpr std::uint64_t AddressSpaceSize = std::uint64_t{1} << 32;
+        if (!RangeFits(segment.memory_offset, segment.decoded_size, AddressSpaceSize)) {
+            result.error = SegmentError(i, "memory range overflows the 32-bit module image");
+            return result;
+        }
+    }
+
+    for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+        for (std::size_t j = i + 1; j < NsoSegmentCount; ++j) {
+            const auto& first = info.segments[i];
+            const auto& second = info.segments[j];
+            if (RangesOverlap(first.file_offset, first.stored_size, second.file_offset,
+                              second.stored_size)) {
+                result.error = SegmentError(j, "overlaps another segment in the file");
+                return result;
+            }
+            if (RangesOverlap(first.memory_offset, first.decoded_size, second.memory_offset,
+                              second.decoded_size)) {
+                result.error = SegmentError(j, "overlaps another segment in memory");
+                return result;
+            }
+        }
+    }
+
+    // A size of zero or one denotes no module name in existing NSO producers/loaders.
+    if (info.module_name_size > 1) {
+        if (info.module_name_offset < NsoHeaderSize ||
+            !RangeFits(info.module_name_offset, info.module_name_size, file.size())) {
+            result.error = "module-name range lies outside the file";
+            return result;
+        }
+        for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+            const auto& segment = info.segments[i];
+            if (RangesOverlap(info.module_name_offset, info.module_name_size, segment.file_offset,
+                              segment.stored_size)) {
+                result.error = "module-name range overlaps an NSO segment";
+                return result;
+            }
+        }
+    }
+
+    const std::uint64_t data_end =
+        static_cast<std::uint64_t>(info.segments[2].memory_offset) + info.segments[2].decoded_size;
+    constexpr std::uint64_t AddressSpaceSize = std::uint64_t{1} << 32;
+    if (!RangeFits(data_end, info.bss_size, AddressSpaceSize)) {
+        result.error = "data and BSS ranges overflow the 32-bit module image";
+        return result;
+    }
+    const std::uint64_t data_and_bss_size =
+        static_cast<std::uint64_t>(info.segments[2].decoded_size) + info.bss_size;
+    for (std::size_t i = 0; i < 2; ++i) {
+        const auto& segment = info.segments[i];
+        if (RangesOverlap(info.segments[2].memory_offset, data_and_bss_size, segment.memory_offset,
+                          segment.decoded_size)) {
+            result.error = "data/BSS memory range overlaps another segment";
+            return result;
+        }
+    }
+
+    if (!ValidateRoExtent(info.api_info, info.segments[1].decoded_size, "API-info", result.error) ||
+        !ValidateRoExtent(info.dynstr, info.segments[1].decoded_size, "dynstr", result.error) ||
+        !ValidateRoExtent(info.dynsym, info.segments[1].decoded_size, "dynsym", result.error)) {
+        return result;
+    }
+
+    if (info.version != 0) {
+        result.warnings.emplace_back("unrecognized nonzero NSO0 version");
+    }
+    if (info.reserved != 0) {
+        result.warnings.emplace_back("reserved header word is nonzero");
+    }
+    if ((info.flags & ~KnownFlagsMask) != 0) {
+        result.warnings.emplace_back("header contains unknown flag bits");
+    }
+    if (std::all_of(info.build_id.begin(), info.build_id.end(),
+                    [](std::uint8_t value) { return value == 0; })) {
+        result.warnings.emplace_back("build ID is all zeroes");
+    }
+    if (info.segments[0].memory_offset > info.segments[1].memory_offset ||
+        info.segments[1].memory_offset > info.segments[2].memory_offset) {
+        result.warnings.emplace_back("segment memory offsets are not in text/rodata/data order");
+    }
+
+    result.info = std::move(info);
+    return result;
+}
+
+NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file, NsoDecompressor lz4_decompressor,
+                          std::uint64_t max_decoded_bytes) {
+    NsoDecodeResult result;
+    NsoInspection inspection = InspectNso(file);
+    result.warnings = std::move(inspection.warnings);
+    if (!inspection) {
+        result.error = std::move(inspection.error);
+        return result;
+    }
+
+    DecodedNso decoded;
+    decoded.info = std::move(*inspection.info);
+    std::uint64_t total_decoded_bytes = 0;
+    bool requires_hash_verification = false;
+    for (const NsoSegmentInfo& segment : decoded.info.segments) {
+        total_decoded_bytes += segment.decoded_size;
+        requires_hash_verification |= segment.hash_required;
+    }
+    if (total_decoded_bytes > max_decoded_bytes ||
+        total_decoded_bytes > std::numeric_limits<std::size_t>::max()) {
+        std::ostringstream error;
+        error << "decoded segments require " << total_decoded_bytes
+              << " bytes, exceeding the configured limit of " << max_decoded_bytes;
+        result.error = error.str();
+        return result;
+    }
+    decoded.required_hashes_verified = !requires_hash_verification;
+    if (requires_hash_verification) {
+        result.warnings.emplace_back(
+            "required segment hashes were not verified by this decoder build");
+    }
+
+    for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+        const NsoSegmentInfo& segment = decoded.info.segments[i];
+        std::vector<std::uint8_t>& destination = decoded.segments[i];
+        if (segment.decoded_size == 0) {
+            continue;
+        }
+        const auto source = file.subspan(segment.file_offset, segment.stored_size);
+        try {
+            destination.resize(segment.decoded_size);
+        } catch (const std::bad_alloc&) {
+            result.error = SegmentError(i, "could not allocate its decoded buffer");
+            return result;
+        } catch (const std::length_error&) {
+            result.error = SegmentError(i, "decoded size is unsupported on this host");
+            return result;
+        }
+
+        switch (segment.compression) {
+        case NsoCompression::None:
+            std::copy(source.begin(), source.end(), destination.begin());
+            break;
+        case NsoCompression::Lz4:
+            if (lz4_decompressor == nullptr) {
+                result.error = SegmentError(i, "requires an LZ4 decompressor");
+                return result;
+            }
+            if (!lz4_decompressor(source, destination)) {
+                result.error = SegmentError(i, "could not be decompressed with LZ4");
+                return result;
+            }
+            break;
+        case NsoCompression::Zbic:
+            result.error = SegmentError(i, "uses unsupported ZBIC compression");
+            return result;
+        }
+    }
+
+    result.image = std::move(decoded);
+    return result;
+}
+
+std::uint32_t FindNsoAarch64EntryOffset(std::span<const std::uint8_t> text) {
+    if (text.size() < 8) {
+        return 0;
+    }
+    const std::uint32_t mod0_offset = ReadU32(text, 4);
+    constexpr std::uint64_t MinimumMod0HeaderSize = 0x1C;
+    constexpr std::uint32_t Mod0Magic = 0x30444F4D; // "MOD0", little-endian
+    if ((mod0_offset & 3) != 0 || !RangeFits(mod0_offset, MinimumMod0HeaderSize, text.size()) ||
+        ReadU32(text, mod0_offset) != Mod0Magic) {
+        return 0;
+    }
+
+    const std::uint32_t instruction = ReadU32(text, 0);
+    if ((instruction & 0xFC000000) != 0x14000000) { // B imm26
+        return 0;
+    }
+    const std::int32_t immediate = static_cast<std::int32_t>(instruction << 6) >> 6;
+    const std::int64_t target = static_cast<std::int64_t>(immediate) * 4;
+    if (target < 0 || !RangeFits(static_cast<std::uint64_t>(target), 4, text.size())) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(target);
+}
+
+std::string NsoBuildIdToHex(const std::array<std::uint8_t, 0x20>& build_id) {
+    constexpr char Digits[] = "0123456789abcdef";
+    std::string result(build_id.size() * 2, '0');
+    for (std::size_t i = 0; i < build_id.size(); ++i) {
+        result[i * 2] = Digits[build_id[i] >> 4];
+        result[i * 2 + 1] = Digits[build_id[i] & 0xF];
+    }
+    return result;
+}
+
+const char* NsoSegmentName(NsoSegmentId segment) {
+    switch (segment) {
+    case NsoSegmentId::Text:
+        return "text";
+    case NsoSegmentId::RoData:
+        return "rodata";
+    case NsoSegmentId::Data:
+        return "data";
+    }
+    return "unknown";
+}
+
+const char* NsoCompressionName(NsoCompression compression) {
+    switch (compression) {
+    case NsoCompression::None:
+        return "none";
+    case NsoCompression::Lz4:
+        return "lz4";
+    case NsoCompression::Zbic:
+        return "zbic";
+    }
+    return "unknown";
+}
+
+} // namespace suyu::recomp

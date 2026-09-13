@@ -25,10 +25,12 @@ rasterizer, and runtime shader translation.
 - `core/recompiler/arm64_to_c.h` discovers AArch64 blocks and emits portable C.
 - `core/arm/recomp/arm_recomp.cpp` implements the normal CPU interface and bridges generated code
   to suyu memory, SVC dispatch, and a lazy Dynarmic fallback.
-- `suyu/game_export.cpp` already extracts application modules and generates AOT projects, but its
-  loader/analyzer is tied to Qt and should become a shared non-UI library.
-- `tools/static_recompiler` provides a deterministic low-level `emit-raw` CLI and an end-to-end
-  native smoke test. It deliberately does not claim container or NSO support yet.
+- `core/recompiler/nso_image.{h,cpp}` now provides checked, non-Qt NSO0 inspection and segment
+  decoding to both the command-line tool and in-app exporter.
+- `suyu/game_export.cpp` retains container/VFS work but now consumes the shared NSO decoder and
+  canonical block discovery instead of maintaining a second parser and branch sweep.
+- `tools/static_recompiler` provides deterministic `emit-raw` and `inspect-nso` commands plus
+  synthetic parser, JSON, LZ4, generation, native-build, and execution tests.
 
 ## Milestones
 
@@ -40,6 +42,9 @@ rasterizer, and runtime shader translation.
 
 ### M1: shared executable analysis
 
+- Current slice: checked NSO0 layout/build-ID/segment inspection, bounded decoding, optional LZ4,
+  explicit ZBIC detection, unverified-hash signaling, and architecture-honest human/JSON CLI
+  output.
 - Move NPDM/NSO parsing, decompression, module layout, build-ID extraction, exported-symbol roots,
   relocation roots, and code-pointer scanning out of the Qt exporter.
 - Add `inspect` and `emit-nso` commands using that shared library.

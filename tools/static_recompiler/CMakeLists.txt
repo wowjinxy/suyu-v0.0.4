@@ -10,9 +10,35 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "suyu-recomp requires a 64-bit host toolchain")
 endif()
 
+add_library(suyu_recompiler_nso STATIC
+    ../../src/core/recompiler/nso_image.cpp
+    ../../src/core/recompiler/nso_image.h
+)
+target_compile_features(suyu_recompiler_nso PUBLIC cxx_std_20)
+target_include_directories(suyu_recompiler_nso PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../../src")
+
 add_executable(suyu_recomp suyu_recomp.cpp)
 target_compile_features(suyu_recomp PRIVATE cxx_std_20)
 target_include_directories(suyu_recomp PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../src")
+target_link_libraries(suyu_recomp PRIVATE suyu_recompiler_nso)
+
+if(NOT TARGET lz4::lz4)
+    find_package(lz4 CONFIG QUIET)
+endif()
+if(TARGET lz4::lz4)
+    target_link_libraries(suyu_recomp PRIVATE lz4::lz4)
+    target_compile_definitions(suyu_recomp PRIVATE SUYU_RECOMPILER_HAS_LZ4=1)
+    if(WIN32)
+        get_target_property(SUYU_RECOMPILER_LZ4_TYPE lz4::lz4 TYPE)
+        if(SUYU_RECOMPILER_LZ4_TYPE STREQUAL "SHARED_LIBRARY")
+            add_custom_command(TARGET suyu_recomp POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "$<TARGET_FILE:lz4::lz4>" "$<TARGET_FILE_DIR:suyu_recomp>"
+                VERBATIM
+            )
+        endif()
+    endif()
+endif()
 if(WIN32)
     target_link_libraries(suyu_recomp PRIVATE shell32)
 endif()
@@ -24,7 +50,17 @@ else()
 endif()
 
 include(CTest)
-if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+if((BUILD_TESTING OR YUZU_TESTS) AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(nso_image_tests tests/nso_image_tests.cpp)
+    target_compile_features(nso_image_tests PRIVATE cxx_std_20)
+    target_link_libraries(nso_image_tests PRIVATE suyu_recompiler_nso)
+    if(MSVC)
+        target_compile_options(nso_image_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(nso_image_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_test(NAME static_recompiler_nso_image COMMAND nso_image_tests)
     add_test(
         NAME static_recompiler_smoke
         COMMAND "${CMAKE_COMMAND}"
@@ -36,4 +72,13 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
             "-P" "${CMAKE_CURRENT_LIST_DIR}/tests/smoke.cmake"
     )
     set_tests_properties(static_recompiler_smoke PROPERTIES TIMEOUT 120)
+
+    add_test(
+        NAME static_recompiler_nso_inspect
+        COMMAND "${CMAKE_COMMAND}"
+            "-DRECOMP_TOOL=$<TARGET_FILE:suyu_recomp>"
+            "-DNSO_TEST_HELPER=$<TARGET_FILE:nso_image_tests>"
+            "-DNSO_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/nso_inspect"
+            "-P" "${CMAKE_CURRENT_LIST_DIR}/tests/nso_inspect.cmake"
+    )
 endif()

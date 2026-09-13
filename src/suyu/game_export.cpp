@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -58,8 +59,8 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
-#include "core/loader/nso.h"
 #include "core/recompiler/arm64_to_c.h"
+#include "core/recompiler/nso_image.h"
 
 // ---------------------------------------------------------------------------
 // Filesystem helpers
@@ -568,122 +569,11 @@ namespace {
 
 /// Represents a discovered ARM64 basic block in the NSO .text segment.
 struct Arm64BasicBlock {
-    u32 vaddr;       ///< Virtual address offset within the segment
-    u32 size;        ///< Block size in bytes
+    u32 vaddr; ///< Virtual address offset within the segment
+    u32 size;  ///< Block size in bytes
     u32 instruction_count;
-    bool is_entry;   ///< Whether this is the segment entry point
+    bool is_entry; ///< Whether this is the segment entry point
 };
-
-/// Classify ARM64 instructions to detect basic block boundaries.
-/// Returns true if the instruction is a block-terminating branch/system call.
-static bool IsBlockTerminator(u32 insn) {
-    // B  (unconditional branch immediate)
-    if ((insn & 0xFC000000) == 0x14000000) return true;
-    // BL (branch with link — call, but still ends the block)
-    if ((insn & 0xFC000000) == 0x94000000) return true;
-    // BR (branch register — indirect jump)
-    if ((insn & 0xFFFFFC1F) == 0xD61F0000) return true;
-    // BLR (branch with link register)
-    if ((insn & 0xFFFFFC1F) == 0xD63F0000) return true;
-    // RET
-    if ((insn & 0xFFFFFC1F) == 0xD65F0000) return true;
-    // CBZ
-    if ((insn & 0x7F000000) == 0x34000000) return true;
-    // CBNZ
-    if ((insn & 0x7F000000) == 0x35000000) return true;
-    // TBZ
-    if ((insn & 0x7F000000) == 0x36000000) return true;
-    // TBNZ
-    if ((insn & 0x7F000000) == 0x37000000) return true;
-    // B.cond (conditional branch)
-    if ((insn & 0xFF000010) == 0x54000000) return true;
-    // SVC (supervisor call — system call boundary)
-    if ((insn & 0xFFE0001F) == 0xD4000001) return true;
-    return false;
-}
-
-/// Returns true if the instruction is a direct branch (B or BL) and extracts the target offset.
-static bool GetDirectBranchTarget(u32 insn, u32 pc, u32& target_out) {
-    // B: imm26 is a signed offset in instructions
-    if ((insn & 0xFC000000) == 0x14000000) {
-        s32 imm26 = static_cast<s32>(insn << 6) >> 6; // sign-extend 26 bits
-        target_out = pc + static_cast<u32>(imm26 * 4);
-        return true;
-    }
-    // BL: same encoding
-    if ((insn & 0xFC000000) == 0x94000000) {
-        s32 imm26 = static_cast<s32>(insn << 6) >> 6;
-        target_out = pc + static_cast<u32>(imm26 * 4);
-        return true;
-    }
-    return false;
-}
-
-/// Perform a linear sweep over ARM64 .text to identify basic blocks.
-/// This discovers block boundaries by looking for branch instructions and branch targets.
-static std::vector<Arm64BasicBlock> AnalyzeArm64BasicBlocks(std::span<const u8> text_data,
-                                                             u32 base_vaddr, bool full_scan) {
-    if (text_data.size() < 4) {
-        return {};
-    }
-
-    const u32 num_instructions = static_cast<u32>(text_data.size() / 4);
-    const u32* insn_ptr = reinterpret_cast<const u32*>(text_data.data());
-
-    // First pass: identify all branch targets so we know where blocks start
-    std::vector<bool> is_block_start(num_instructions, false);
-    is_block_start[0] = true; // Entry point of the segment
-
-    for (u32 i = 0; i < num_instructions; ++i) {
-        u32 insn = insn_ptr[i];
-        u32 pc = base_vaddr + i * 4;
-
-        if (IsBlockTerminator(insn)) {
-            // The instruction after a terminator starts a new block
-            if (i + 1 < num_instructions) {
-                is_block_start[i + 1] = true;
-            }
-
-            // If it's a direct branch, the target also starts a block
-            u32 target = 0;
-            if (GetDirectBranchTarget(insn, pc, target)) {
-                u32 target_index = (target - base_vaddr) / 4;
-                if (target_index < num_instructions) {
-                    is_block_start[target_index] = true;
-                }
-            }
-        }
-    }
-
-    // Second pass: build block list from boundaries
-    std::vector<Arm64BasicBlock> blocks;
-    blocks.reserve(num_instructions / 8); // Heuristic: average 8 instructions per block
-
-    u32 block_start_idx = 0;
-    for (u32 i = 1; i <= num_instructions; ++i) {
-        if (i == num_instructions || is_block_start[i]) {
-            Arm64BasicBlock block{};
-            block.vaddr = base_vaddr + block_start_idx * 4;
-            block.size = (i - block_start_idx) * 4;
-            block.instruction_count = i - block_start_idx;
-            block.is_entry = (block_start_idx == 0);
-            blocks.push_back(block);
-            block_start_idx = i;
-        }
-    }
-
-    return blocks;
-}
-
-/// Compute a hex string from a build ID array.
-static QString BuildIdToHex(const std::array<u8, 0x20>& build_id) {
-    QString hex;
-    hex.reserve(0x40);
-    for (u8 byte : build_id) {
-        hex.append(QStringLiteral("%1").arg(byte, 2, 16, QLatin1Char('0')));
-    }
-    return hex;
-}
 
 /// Information extracted from a single NSO module.
 struct NsoAnalysisResult {
@@ -706,50 +596,32 @@ struct NsoAnalysisResult {
     std::vector<Arm64BasicBlock> blocks;
 };
 
-/// Offset of the first real instruction within a decompressed .text.
-///
-/// An NSO's .text opens with a branch word, then the MOD0 header the offset at
-/// +4 points at, then zero padding - none of which is code. Starting a
-/// recompiled image at .text+0 therefore begins mid-header, and because
-/// nothing branches to the true entry it never becomes a block start either.
-static u32 FindNsoEntryOffset(std::span<const u8> text) {
-    if (text.size() < 0x10) {
-        return 0;
-    }
-    u32 mod0_off = 0;
-    std::memcpy(&mod0_off, text.data() + 4, sizeof(mod0_off));
-
-    // MOD0 itself is 0x1C bytes; walk past it and then over the padding to the
-    // first non-zero word.
-    size_t off = (static_cast<size_t>(mod0_off) + 0x1C + 3) & ~size_t{3};
-    if (off >= text.size()) {
-        return 0;
-    }
-    while (off + 4 <= text.size()) {
-        u32 word = 0;
-        std::memcpy(&word, text.data() + off, sizeof(word));
-        if (word != 0) {
-            return static_cast<u32>(off);
-        }
-        off += 4;
-    }
-    return 0;
-}
-
 /// Reads bytes at a module-relative virtual address out of whichever of the
 /// three decompressed segments actually contains it. .dynamic/.dynsym/.dynstr
 /// can live in text or rodata depending on toolchain, so callers walking them
 /// need one accessor spanning all three rather than assuming a segment.
 static bool ReadModuleBytes(const NsoAnalysisResult& mod, u64 vaddr, u8* out, size_t len) {
     auto try_seg = [&](u64 seg_vaddr, const std::vector<u8>& bytes) {
-        if (vaddr < seg_vaddr) return false;
+        if (vaddr < seg_vaddr)
+            return false;
         const u64 off = vaddr - seg_vaddr;
-        if (off + len > bytes.size()) return false;
+        if (len > bytes.size() || off > bytes.size() - len)
+            return false;
         std::memcpy(out, bytes.data() + off, len);
         return true;
     };
-    return try_seg(mod.text_vaddr, mod.text_bytes) ||
-           try_seg(mod.rodata_vaddr, mod.rodata_bytes) ||
+    return try_seg(mod.text_vaddr, mod.text_bytes) || try_seg(mod.rodata_vaddr, mod.rodata_bytes) ||
+           try_seg(mod.data_vaddr, mod.data_bytes);
+}
+
+static bool ModuleRangeFits(const NsoAnalysisResult& mod, u64 vaddr, u64 len) {
+    const auto try_seg = [&](u64 seg_vaddr, const std::vector<u8>& bytes) {
+        if (vaddr < seg_vaddr || len > bytes.size())
+            return false;
+        const u64 off = vaddr - seg_vaddr;
+        return off <= bytes.size() - len;
+    };
+    return try_seg(mod.text_vaddr, mod.text_bytes) || try_seg(mod.rodata_vaddr, mod.rodata_bytes) ||
            try_seg(mod.data_vaddr, mod.data_bytes);
 }
 
@@ -797,7 +669,8 @@ static std::vector<u64> ScanDataForCodePointers(const NsoAnalysisResult& mod) {
     const u64 text_lo = mod.text_vaddr;
     const u64 text_hi = mod.text_vaddr + mod.text_bytes.size();
     const auto scan = [&](const std::vector<u8>& bytes) {
-        if (bytes.size() < 8) return;
+        if (bytes.size() < 8)
+            return;
         for (size_t off = 0; off + 8 <= bytes.size(); off += 8) {
             u64 v = 0;
             std::memcpy(&v, bytes.data() + off, sizeof(v));
@@ -829,36 +702,52 @@ static std::vector<u64> ScanDataForCodePointers(const NsoAnalysisResult& mod) {
 /// address only ever costs one extra block boundary, never a wrong block.
 static std::vector<u64> ScanRelocationsForCodePointers(const NsoAnalysisResult& mod) {
     std::vector<u64> out;
-    if (mod.text_bytes.size() < 8) return out;
+    if (mod.text_bytes.size() < 8)
+        return out;
 
     u32 mod0_off = 0;
     std::memcpy(&mod0_off, mod.text_bytes.data() + 4, sizeof(mod0_off));
     const u64 mod0_va = mod.text_vaddr + mod0_off;
-    if (ReadModuleU32(mod, mod0_va) != 0x30444F4Du) return out;
+    if (ReadModuleU32(mod, mod0_va) != 0x30444F4Du)
+        return out;
 
     const u32 dyn_rel_off = ReadModuleU32(mod, mod0_va + 4);
     const u64 dyn_va = mod0_va + dyn_rel_off;
 
     constexpr u32 DT_NULL = 0, DT_PLTRELSZ = 2, DT_SYMTAB = 6, DT_RELA = 7, DT_RELASZ = 8,
-                   DT_JMPREL = 23;
+                  DT_JMPREL = 23;
     u64 rela_va = 0, rela_sz = 0, jmprel_va = 0, jmprel_sz = 0, symtab_va = 0;
     for (u64 p = dyn_va, guard = 0; guard < 0x1000; p += 16, guard += 16) {
         const u64 tag = ReadModuleU64(mod, p);
         const u64 val = ReadModuleU64(mod, p + 8);
-        if (tag == DT_NULL) break;
-        if (tag == DT_RELA) rela_va = val;
-        if (tag == DT_RELASZ) rela_sz = val;
-        if (tag == DT_JMPREL) jmprel_va = val;
-        if (tag == DT_PLTRELSZ) jmprel_sz = val;
-        if (tag == DT_SYMTAB) symtab_va = val;
+        if (tag == DT_NULL)
+            break;
+        if (tag == DT_RELA)
+            rela_va = val;
+        if (tag == DT_RELASZ)
+            rela_sz = val;
+        if (tag == DT_JMPREL)
+            jmprel_va = val;
+        if (tag == DT_PLTRELSZ)
+            jmprel_sz = val;
+        if (tag == DT_SYMTAB)
+            symtab_va = val;
     }
 
     const u64 text_lo = mod.text_vaddr;
     const u64 text_hi = mod.text_vaddr + mod.text_bytes.size();
-    constexpr u32 R_AARCH64_ABS64 = 0x101, R_AARCH64_GLOB_DAT = 0x401,
-                   R_AARCH64_JUMP_SLOT = 0x402, R_AARCH64_RELATIVE = 0x403;
+    constexpr u32 R_AARCH64_ABS64 = 0x101, R_AARCH64_GLOB_DAT = 0x401, R_AARCH64_JUMP_SLOT = 0x402,
+                  R_AARCH64_RELATIVE = 0x403;
     const auto scan_table = [&](u64 table_va, u64 table_sz) {
-        for (u64 p = table_va; p + 24 <= table_va + table_sz; p += 24) {
+        constexpr u64 RelaEntrySize = 24;
+        constexpr u64 MaxRelocationEntries = 4'000'000;
+        const u64 entry_count = table_sz / RelaEntrySize;
+        if ((table_sz % RelaEntrySize) != 0 || entry_count > MaxRelocationEntries ||
+            !ModuleRangeFits(mod, table_va, entry_count * RelaEntrySize)) {
+            return;
+        }
+        for (u64 index = 0; index < entry_count; ++index) {
+            const u64 p = table_va + index * RelaEntrySize;
             const u64 r_info = ReadModuleU64(mod, p + 8);
             const u64 r_addend = ReadModuleU64(mod, p + 16);
             const u32 r_type = static_cast<u32>(r_info & 0xFFFFFFFF);
@@ -879,21 +768,25 @@ static std::vector<u64> ScanRelocationsForCodePointers(const NsoAnalysisResult& 
             }
         }
     };
-    if (rela_va && rela_sz) scan_table(rela_va, rela_sz);
-    if (jmprel_va && jmprel_sz) scan_table(jmprel_va, jmprel_sz);
+    if (rela_va && rela_sz)
+        scan_table(rela_va, rela_sz);
+    if (jmprel_va && jmprel_sz)
+        scan_table(jmprel_va, jmprel_sz);
     return out;
 }
 
 static std::vector<u64> CollectExportedSymbolAddresses(const NsoAnalysisResult& mod) {
     std::vector<u64> out;
-    if (mod.text_bytes.size() < 8) return out;
+    if (mod.text_bytes.size() < 8)
+        return out;
 
-    // MOD0 offset is stored at text+4, relative to the start of .text (same
-    // field FindNsoEntryOffset walks past to find the real entry point).
+    // MOD0 offset is stored at text+4, relative to the start of .text. This is the same pointer
+    // validated by FindNsoAarch64EntryOffset.
     u32 mod0_off = 0;
     std::memcpy(&mod0_off, mod.text_bytes.data() + 4, sizeof(mod0_off));
     const u64 mod0_va = mod.text_vaddr + mod0_off;
-    if (ReadModuleU32(mod, mod0_va) != 0x30444F4Du) return out; // "MOD0"
+    if (ReadModuleU32(mod, mod0_va) != 0x30444F4Du)
+        return out; // "MOD0"
 
     const u32 dyn_rel_off = ReadModuleU32(mod, mod0_va + 4);
     const u64 dyn_va = mod0_va + dyn_rel_off;
@@ -903,11 +796,15 @@ static std::vector<u64> CollectExportedSymbolAddresses(const NsoAnalysisResult& 
     for (u64 p = dyn_va, guard = 0; guard < 0x1000; p += 16, guard += 16) {
         const u64 tag = ReadModuleU64(mod, p);
         const u64 val = ReadModuleU64(mod, p + 8);
-        if (tag == DT_NULL) break;
-        if (tag == DT_SYMTAB) symtab_va = val;
-        if (tag == DT_STRTAB) strtab_va = val;
+        if (tag == DT_NULL)
+            break;
+        if (tag == DT_SYMTAB)
+            symtab_va = val;
+        if (tag == DT_STRTAB)
+            strtab_va = val;
     }
-    if (!symtab_va || !strtab_va || strtab_va <= symtab_va) return out;
+    if (!symtab_va || !strtab_va || strtab_va <= symtab_va)
+        return out;
 
     // .dynsym/.dynstr are laid out back to back, so the gap between them
     // bounds the entry count (no explicit count exists for a plain DT_SYMTAB).
@@ -916,83 +813,72 @@ static std::vector<u64> CollectExportedSymbolAddresses(const NsoAnalysisResult& 
     for (u32 i = 1; i < max_index; ++i) { // index 0 is always the null symbol
         const u64 sym_va = symtab_va + static_cast<u64>(i) * 24;
         const u16 shndx = static_cast<u16>(ReadModuleU32(mod, sym_va + 6) & 0xFFFF);
-        if (shndx == 0) continue; // SHN_UNDEF - an import, not an export
+        if (shndx == 0)
+            continue; // SHN_UNDEF - an import, not an export
         const u64 value = ReadModuleU64(mod, sym_va + 8);
-        if (value) out.push_back(value);
+        if (value)
+            out.push_back(value);
     }
     return out;
 }
 
 /// Parse and analyze a single NSO file using the VFS.
+static bool DecompressNsoLz4(std::span<const std::uint8_t> source,
+                             std::span<std::uint8_t> destination) {
+    if (source.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        destination.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    return Common::Compression::DecompressDataLZ4(destination.data(), destination.size(),
+                                                  source.data(), source.size()) ==
+           static_cast<int>(destination.size());
+}
+
 static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFile& nso_file,
-                                                        bool full_scan) {
-    if (!nso_file || nso_file->GetSize() < sizeof(Loader::NSOHeader)) {
+                                                       bool full_scan) {
+    if (!nso_file) {
         return std::nullopt;
     }
 
-    Loader::NSOHeader header{};
-    if (nso_file->ReadObject(&header) != sizeof(Loader::NSOHeader)) {
+    std::vector<u8> nso_bytes = nso_file->ReadAllBytes();
+    auto decoded = suyu::recomp::DecodeNso(nso_bytes, DecompressNsoLz4);
+    if (!decoded) {
+        LOG_WARNING(Frontend, "Could not decode NSO {}: {}", nso_file->GetName(), decoded.error);
         return std::nullopt;
+    }
+    for (const std::string& warning : decoded.warnings) {
+        LOG_WARNING(Frontend, "NSO {}: {}", nso_file->GetName(), warning);
     }
 
-    if (header.magic != Common::MakeMagic('N', 'S', 'O', '0')) {
-        return std::nullopt;
-    }
+    const auto& info = decoded.image->info;
 
     NsoAnalysisResult result{};
     result.name = QString::fromStdString(nso_file->GetName());
-    result.build_id_hex = BuildIdToHex(header.build_id);
+    result.build_id_hex = QString::fromStdString(suyu::recomp::NsoBuildIdToHex(info.build_id));
 
     // Extract segment metadata
-    result.text_vaddr = header.segments[0].location;
-    result.text_size = header.segments[0].size;
-    result.rodata_vaddr = header.segments[1].location;
-    result.rodata_size = header.segments[1].size;
-    result.data_vaddr = header.segments[2].location;
-    result.data_size = header.segments[2].size;
+    result.text_vaddr = info.segments[0].memory_offset;
+    result.text_size = info.segments[0].decoded_size;
+    result.rodata_vaddr = info.segments[1].memory_offset;
+    result.rodata_size = info.segments[1].decoded_size;
+    result.data_vaddr = info.segments[2].memory_offset;
+    result.data_size = info.segments[2].decoded_size;
+    result.text_bytes = std::move(decoded.image->segments[0]);
+    result.rodata_bytes = std::move(decoded.image->segments[1]);
+    result.data_bytes = std::move(decoded.image->segments[2]);
+    result.entry_vaddr = static_cast<u64>(result.text_vaddr) +
+                         suyu::recomp::FindNsoAarch64EntryOffset(result.text_bytes);
 
-    // Read and decompress .text segment (segment 0)
-    std::vector<u8> text_data = nso_file->ReadBytes(
-        header.segments_compressed_size[0], header.segments[0].offset);
-
-    if (text_data.empty()) {
-        return std::nullopt;
+    // Use the same block discovery implementation as the CLI and emitter. The old frontend-local
+    // sweep missed conditional branch targets and could therefore report a different block map.
+    (void)full_scan; // The previous sweep accepted this option but did not vary its behavior.
+    const auto canonical_blocks = suyu::recomp::DiscoverBlocks(
+        result.text_bytes.data(), result.text_bytes.size(), result.text_vaddr, result.entry_vaddr);
+    result.blocks.reserve(canonical_blocks.size());
+    for (const auto& block : canonical_blocks) {
+        result.blocks.push_back(Arm64BasicBlock{static_cast<u32>(block.vaddr), block.size,
+                                                block.count, block.is_entry});
     }
-
-    if (header.IsSegmentCompressed(0)) {
-        text_data = Common::Compression::DecompressDataLZ4(text_data, header.segments[0].size);
-        if (text_data.empty()) {
-            return std::nullopt;
-        }
-    }
-
-    result.text_bytes = text_data;
-    result.entry_vaddr = static_cast<u64>(result.text_vaddr) + FindNsoEntryOffset(result.text_bytes);
-
-    // Read and decompress .rodata segment (segment 1)
-    {
-        std::vector<u8> seg = nso_file->ReadBytes(
-            header.segments_compressed_size[1], header.segments[1].offset);
-        if (!seg.empty() && header.IsSegmentCompressed(1)) {
-            seg = Common::Compression::DecompressDataLZ4(seg, header.segments[1].size);
-        }
-        result.rodata_bytes = std::move(seg);
-    }
-
-    // Read and decompress .data segment (segment 2)
-    {
-        std::vector<u8> seg = nso_file->ReadBytes(
-            header.segments_compressed_size[2], header.segments[2].offset);
-        if (!seg.empty() && header.IsSegmentCompressed(2)) {
-            seg = Common::Compression::DecompressDataLZ4(seg, header.segments[2].size);
-        }
-        result.data_bytes = std::move(seg);
-    }
-
-    // Analyze ARM64 basic blocks in the .text segment
-    result.blocks = AnalyzeArm64BasicBlocks(
-        std::span<const u8>{result.text_bytes.data(), result.text_bytes.size()},
-        header.segments[0].location, full_scan);
 
     result.total_blocks = static_cast<u32>(result.blocks.size());
     result.total_instructions = 0;

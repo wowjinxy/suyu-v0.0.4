@@ -17,6 +17,8 @@ add_library(core STATIC
     arm/symbols.h
     constants.cpp
     constants.h
+    recompiler/nso_image.cpp
+    recompiler/nso_image.h
     core.cpp
     core.h
     libretro_wrapper.cpp
