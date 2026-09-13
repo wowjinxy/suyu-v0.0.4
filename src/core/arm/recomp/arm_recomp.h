@@ -133,11 +133,11 @@ public:
 private:
     /// Builds the JIT fallback if needed and marks this thread as running on
     /// it. Returns false when no JIT can be built (no process/monitor).
-    bool EnterFallback();
-    /// Runs the JIT fallback for one scheduling slice, syncing guest state in
-    /// and back out, and returns to recompiled execution once the PC is covered
-    /// again.
-    HaltReason RunFallback(Kernel::KThread* thread);
+    bool EnterFallback(Kernel::KThread* thread);
+    /// Runs the JIT fallback, syncing guest state in and back out. A full
+    /// scheduling slice returns to recompiled execution once the PC is covered
+    /// again; single-step mode executes exactly one JIT instruction.
+    HaltReason RunFallback(Kernel::KThread* thread, bool single_step = false);
 
     struct Impl;
     std::unique_ptr<Impl> impl;
