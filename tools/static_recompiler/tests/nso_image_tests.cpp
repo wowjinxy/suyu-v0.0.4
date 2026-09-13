@@ -21,6 +21,11 @@ namespace {
 
 using Byte = std::uint8_t;
 
+void PutU16(std::vector<Byte>& bytes, std::size_t offset, std::uint16_t value) {
+    bytes[offset] = static_cast<Byte>(value);
+    bytes[offset + 1] = static_cast<Byte>(value >> 8);
+}
+
 void PutU32(std::vector<Byte>& bytes, std::size_t offset, std::uint32_t value) {
     bytes[offset] = static_cast<Byte>(value);
     bytes[offset + 1] = static_cast<Byte>(value >> 8);
@@ -146,6 +151,8 @@ std::vector<Byte> MakeDynamicNso() {
     constexpr std::uint32_t RelaAddress = RoDataAddress + 0x100;
     constexpr std::uint32_t PltRelaAddress = RelaAddress + 0x18;
     constexpr std::uint32_t SymbolTableAddress = RoDataAddress + 0x180;
+    constexpr std::uint32_t StringTableAddress = RoDataAddress + 0x1E0;
+    constexpr std::string_view DynamicStrings{"\0imported\0exported\0absolute\0", 28};
 
     std::vector<Byte> bytes(DataFile + DataSize);
     std::copy_n(reinterpret_cast<const Byte*>("NSO0"), 4, bytes.begin());
@@ -162,6 +169,10 @@ std::vector<Byte> MakeDynamicNso() {
     PutU32(bytes, 0x60, TextSize);
     PutU32(bytes, 0x64, RoDataSize);
     PutU32(bytes, 0x68, DataSize);
+    PutU32(bytes, 0x90, StringTableAddress - RoDataAddress);
+    PutU32(bytes, 0x94, static_cast<std::uint32_t>(DynamicStrings.size()));
+    PutU32(bytes, 0x98, SymbolTableAddress - RoDataAddress);
+    PutU32(bytes, 0x9C, 4 * 24);
     for (std::size_t i = 0; i < 0x20; ++i) {
         bytes[0x40 + i] = static_cast<Byte>(0x40 + i);
     }
@@ -186,15 +197,17 @@ std::vector<Byte> MakeDynamicNso() {
         PutU64(bytes, offset, static_cast<std::uint64_t>(tag));
         PutU64(bytes, offset + 8, value);
     };
-    put_dynamic(0, 7, RelaAddress);        // DT_RELA
-    put_dynamic(1, 8, 24);                 // DT_RELASZ
-    put_dynamic(2, 9, 24);                 // DT_RELAENT
-    put_dynamic(3, 23, PltRelaAddress);    // DT_JMPREL
-    put_dynamic(4, 2, 24);                 // DT_PLTRELSZ
-    put_dynamic(5, 20, 7);                 // DT_PLTREL = DT_RELA
-    put_dynamic(6, 6, SymbolTableAddress); // DT_SYMTAB
-    put_dynamic(7, 11, 24);                // DT_SYMENT
-    put_dynamic(8, 0, 0);                  // DT_NULL
+    put_dynamic(0, 7, RelaAddress);            // DT_RELA
+    put_dynamic(1, 8, 24);                     // DT_RELASZ
+    put_dynamic(2, 9, 24);                     // DT_RELAENT
+    put_dynamic(3, 23, PltRelaAddress);        // DT_JMPREL
+    put_dynamic(4, 2, 24);                     // DT_PLTRELSZ
+    put_dynamic(5, 20, 7);                     // DT_PLTREL = DT_RELA
+    put_dynamic(6, 6, SymbolTableAddress);     // DT_SYMTAB
+    put_dynamic(7, 11, 24);                    // DT_SYMENT
+    put_dynamic(8, 5, StringTableAddress);     // DT_STRTAB
+    put_dynamic(9, 10, DynamicStrings.size()); // DT_STRSZ
+    put_dynamic(10, 0, 0);                     // DT_NULL
 
     const auto put_rela = [&](std::uint32_t address, std::uint64_t target, std::uint32_t symbol,
                               std::uint32_t type, std::int64_t addend) {
@@ -205,7 +218,22 @@ std::vector<Byte> MakeDynamicNso() {
     };
     put_rela(RelaAddress, DataAddress, 0, 0x403, TextAddress + 0x10);
     put_rela(PltRelaAddress, DataAddress + DataSize, 1, 0x402, 0);
-    // Leave complete, readable null and index-one ELF64 symbol entries in rodata.
+
+    const std::size_t symbol_table = ro_file_offset(SymbolTableAddress);
+    // Symbol zero remains the required all-zero null entry.
+    PutU32(bytes, symbol_table + 24, 1);
+    bytes[symbol_table + 24 + 4] = 0x22; // STB_WEAK | STT_FUNC
+    PutU32(bytes, symbol_table + 48, 10);
+    bytes[symbol_table + 48 + 4] = 0x12; // STB_GLOBAL | STT_FUNC
+    PutU16(bytes, symbol_table + 48 + 6, 1);
+    PutU64(bytes, symbol_table + 48 + 8, TextAddress + 0x10);
+    PutU64(bytes, symbol_table + 48 + 16, 4);
+    PutU32(bytes, symbol_table + 72, 19);
+    bytes[symbol_table + 72 + 4] = 0x11;          // STB_GLOBAL | STT_OBJECT
+    PutU16(bytes, symbol_table + 72 + 6, 0xFFF1); // SHN_ABS
+    PutU64(bytes, symbol_table + 72 + 16, 8);
+    std::copy(DynamicStrings.begin(), DynamicStrings.end(),
+              bytes.begin() + ro_file_offset(StringTableAddress));
 
     return bytes;
 }

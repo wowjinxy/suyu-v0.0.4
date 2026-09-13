@@ -96,10 +96,11 @@ if(NOT DYNAMIC_INSPECT_RESULT EQUAL 0)
 endif()
 foreach(EXPECTED
         "AArch64 entry: 0x1010"
-        "ELF64 dynamic: MOD0=0x6000 table=0x6020 non-null-entries=8 bytes=144"
+        "ELF64 dynamic: MOD0=0x6000 table=0x6020 non-null-entries=10 bytes=176"
         "Dynamic symbols: address=0x6180 entry-size=24"
         "Dynamic RELA: address=0x6100 bytes=24 entries=1 entry-size=24"
-        "PLT RELA: address=0x6118 bytes=24 entries=1 entry-size=24")
+        "PLT RELA: address=0x6118 bytes=24 entries=1 entry-size=24"
+        "ELF64 symbols: entries=4 imports=1 weak-imports=1 exports=2 absolute-definitions=1 relocation-indices=verified")
     string(FIND "${DYNAMIC_INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
     if(EXPECTED_POSITION EQUAL -1)
         message(FATAL_ERROR
@@ -125,12 +126,27 @@ string(JSON DYNAMIC_RELA_ENTRIES_TYPE TYPE "${DYNAMIC_JSON_OUTPUT}"
        dynamic_analysis rela entries)
 string(JSON DYNAMIC_RELA_ENTRIES GET "${DYNAMIC_JSON_OUTPUT}" dynamic_analysis rela entries)
 string(JSON DYNAMIC_PLT_ENTRIES GET "${DYNAMIC_JSON_OUTPUT}" dynamic_analysis plt_rela entries)
+string(JSON DYNAMIC_SYMBOL_ENTRIES_TYPE TYPE "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis symbol_analysis entries)
+string(JSON DYNAMIC_SYMBOL_ENTRIES GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis symbol_analysis entries)
+string(JSON DYNAMIC_WEAK_IMPORTS GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis symbol_analysis weak_imports)
+string(JSON DYNAMIC_ABSOLUTE_DEFINITIONS GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis symbol_analysis absolute_definitions)
+string(JSON DYNAMIC_RELOCATION_INDICES GET "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis symbol_analysis relocation_indices_verified)
 if(NOT DYNAMIC_ANALYSIS_TYPE STREQUAL "OBJECT" OR
    NOT DYNAMIC_FORMAT STREQUAL "ELF64" OR
    NOT DYNAMIC_MOD0 STREQUAL "0x6000" OR
    NOT DYNAMIC_RELA_ENTRIES_TYPE STREQUAL "NUMBER" OR
    NOT DYNAMIC_RELA_ENTRIES EQUAL 1 OR
-   NOT DYNAMIC_PLT_ENTRIES EQUAL 1)
+   NOT DYNAMIC_PLT_ENTRIES EQUAL 1 OR
+   NOT DYNAMIC_SYMBOL_ENTRIES_TYPE STREQUAL "NUMBER" OR
+   NOT DYNAMIC_SYMBOL_ENTRIES EQUAL 4 OR
+   NOT DYNAMIC_WEAK_IMPORTS EQUAL 1 OR
+   NOT DYNAMIC_ABSOLUTE_DEFINITIONS EQUAL 1 OR
+   NOT DYNAMIC_RELOCATION_INDICES)
     message(FATAL_ERROR "Dynamic JSON schema is invalid:\n${DYNAMIC_JSON_OUTPUT}")
 endif()
 

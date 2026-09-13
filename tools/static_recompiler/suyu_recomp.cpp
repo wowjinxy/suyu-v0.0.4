@@ -5,6 +5,7 @@
 #include "core/recompiler/npdm_info.h"
 #include "core/recompiler/nso_dynamic.h"
 #include "core/recompiler/nso_image.h"
+#include "core/recompiler/nso_symbols.h"
 #include "nso_sha256.h"
 
 #include <algorithm>
@@ -532,6 +533,33 @@ struct LoadedNpdm {
     std::vector<std::string> warnings;
 };
 
+struct DynamicSymbolSummary {
+    std::size_t entries{};
+    std::size_t imports{};
+    std::size_t weak_imports{};
+    std::size_t exports{};
+    std::size_t absolute_definitions{};
+};
+
+DynamicSymbolSummary SummarizeDynamicSymbols(const suyu::recomp::NsoDynamicSymbolInfo& info) {
+    DynamicSymbolSummary summary{.entries = info.symbols.size()};
+    for (const suyu::recomp::NsoDynamicSymbol& symbol : info.symbols) {
+        if (symbol.IsUndefined() && !symbol.name.empty()) {
+            ++summary.imports;
+            if (symbol.IsWeak()) {
+                ++summary.weak_imports;
+            }
+        }
+        if (symbol.IsExternallyVisibleDefinition()) {
+            ++summary.exports;
+        }
+        if (symbol.IsAbsolute() && !symbol.name.empty()) {
+            ++summary.absolute_definitions;
+        }
+    }
+    return summary;
+}
+
 std::optional<LoadedNpdm> LoadNpdm(const std::filesystem::path& path) {
     const auto bytes = ReadFile(path, "main.npdm", suyu::recomp::MaximumNpdmSize);
     if (!bytes) {
@@ -671,7 +699,9 @@ int InspectNso(const Options& options) {
         (npdm && npdm->info.architecture == suyu::recomp::NpdmArchitecture::Aarch64);
 
     std::optional<suyu::recomp::NsoDynamicInfo> dynamic_info;
+    std::optional<DynamicSymbolSummary> dynamic_symbol_summary;
     std::string dynamic_error;
+    std::string dynamic_symbol_error;
     if (analyze_aarch64) {
         if (!decoded) {
             dynamic_error = decoded.error;
@@ -683,6 +713,14 @@ int InspectNso(const Options& options) {
             } else {
                 dynamic_error = std::move(dynamic.error);
             }
+        }
+    }
+    if (dynamic_info) {
+        auto symbols = suyu::recomp::ParseNsoDynamicSymbols(*decoded.image, *dynamic_info);
+        if (symbols) {
+            dynamic_symbol_summary = SummarizeDynamicSymbols(*symbols.info);
+        } else {
+            dynamic_symbol_error = std::move(symbols.error);
         }
     }
 
@@ -804,6 +842,18 @@ int InspectNso(const Options& options) {
                 };
                 print_rela("Dynamic RELA", dynamic_info->rela);
                 print_rela("PLT RELA", dynamic_info->plt_rela);
+                if (dynamic_symbol_summary) {
+                    std::cout << "ELF64 symbols: entries=" << dynamic_symbol_summary->entries
+                              << " imports=" << dynamic_symbol_summary->imports
+                              << " weak-imports=" << dynamic_symbol_summary->weak_imports
+                              << " exports=" << dynamic_symbol_summary->exports
+                              << " absolute-definitions="
+                              << dynamic_symbol_summary->absolute_definitions
+                              << " relocation-indices=verified\n";
+                } else {
+                    std::cout << "ELF64 symbol analysis: unavailable (" << dynamic_symbol_error
+                              << ")\n";
+                }
             } else {
                 std::cout << "ELF64 dynamic analysis: unavailable (" << dynamic_error << ")\n";
             }
@@ -930,6 +980,18 @@ int InspectNso(const Options& options) {
                       << "\", \"entry_size\": " << dynamic_info->symbol_entry_size << '}';
         } else {
             std::cout << "null";
+        }
+        std::cout << ", \"symbol_analysis\": ";
+        if (dynamic_symbol_summary) {
+            std::cout << "{\"entries\": " << dynamic_symbol_summary->entries
+                      << ", \"imports\": " << dynamic_symbol_summary->imports
+                      << ", \"weak_imports\": " << dynamic_symbol_summary->weak_imports
+                      << ", \"exports\": " << dynamic_symbol_summary->exports
+                      << ", \"absolute_definitions\": "
+                      << dynamic_symbol_summary->absolute_definitions
+                      << ", \"relocation_indices_verified\": true}";
+        } else {
+            std::cout << "{\"error\": \"" << JsonEscape(dynamic_symbol_error) << "\"}";
         }
         std::cout << ", \"rela\": ";
         print_optional_table(dynamic_info->rela);
