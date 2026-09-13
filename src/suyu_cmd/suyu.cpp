@@ -3,14 +3,16 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <regex>
-#include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include <fmt/ostream.h>
@@ -116,13 +118,76 @@ static void PrintHelp(const char* argv0) {
                  "-l, "
                  "--applet-params="
                  "\"program_id,applet_id,applet_type,launch_type,prog_index,prev_prog_index\"\n"
-                 "                      Numerical parameters for launching an applet. If no\n"
+                 "                      Decimal parameters for launching an applet. If no\n"
                  "                      game is provided, then the applet will launch off of\n"
                  "                      the applet_id.\n";
 }
 
 static void PrintVersion() {
     std::cout << "suyu" << Common::g_scm_branch << " " << Common::g_scm_desc << std::endl;
+}
+
+template <typename T>
+static bool ParseDecimalInteger(std::string_view text, T& value) {
+    if (text.empty()) {
+        return false;
+    }
+
+    T parsed{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed, 10);
+    if (error != std::errc{} || end != text.data() + text.size()) {
+        return false;
+    }
+
+    value = parsed;
+    return true;
+}
+
+static std::optional<Service::AM::FrontendAppletParameters> ParseAppletParameters(
+    std::string_view text) {
+    std::array<std::string_view, 6> fields{};
+    std::size_t offset{};
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        const std::size_t separator = text.find(',', offset);
+        if ((i + 1 < fields.size() && separator == std::string_view::npos) ||
+            (i + 1 == fields.size() && separator != std::string_view::npos)) {
+            return std::nullopt;
+        }
+
+        const std::size_t end = separator == std::string_view::npos ? text.size() : separator;
+        fields[i] = text.substr(offset, end - offset);
+        offset = end + 1;
+    }
+
+    u64 program_id{};
+    u32 applet_id{};
+    s32 applet_type{};
+    s32 launch_type{};
+    s32 program_index{};
+    s32 previous_program_index{};
+    if (!ParseDecimalInteger(fields[0], program_id) ||
+        !ParseDecimalInteger(fields[1], applet_id) ||
+        !ParseDecimalInteger(fields[2], applet_type) ||
+        !ParseDecimalInteger(fields[3], launch_type) ||
+        !ParseDecimalInteger(fields[4], program_index) ||
+        !ParseDecimalInteger(fields[5], previous_program_index) ||
+        program_id == 0 || applet_id == static_cast<u32>(Service::AM::AppletId::None) ||
+        program_index < 0 ||
+        applet_type < static_cast<s32>(Service::AM::AppletType::Application) ||
+        applet_type > static_cast<s32>(Service::AM::AppletType::SystemApplet) ||
+        launch_type < static_cast<s32>(Service::AM::LaunchType::FrontendInitiated) ||
+        launch_type > static_cast<s32>(Service::AM::LaunchType::ApplicationInitiated)) {
+        return std::nullopt;
+    }
+
+    return Service::AM::FrontendAppletParameters{
+        .program_id = program_id,
+        .applet_id = static_cast<Service::AM::AppletId>(applet_id),
+        .applet_type = static_cast<Service::AM::AppletType>(applet_type),
+        .launch_type = static_cast<Service::AM::LaunchType>(launch_type),
+        .program_index = program_index,
+        .previous_program_index = previous_program_index,
+    };
 }
 
 static void OnStateChanged(const Network::RoomMember::State& state) {
@@ -326,7 +391,7 @@ int main(int argc, char** argv) {
         {"fullscreen", no_argument, 0, 'f'},
         {"help", no_argument, 0, 'h'},
         {"game", required_argument, 0, 'g'},
-        {"applet-params", optional_argument, 0, 'l'},
+        {"applet-params", required_argument, 0, 'l'},
         {"multiplayer", required_argument, 0, 'm'},
         {"program", optional_argument, 0, 'p'},
         {"user", required_argument, 0, 'u'},
@@ -336,7 +401,7 @@ int main(int argc, char** argv) {
     };
 
     while (optind < argc) {
-        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l::", long_options, &option_index);
+        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l:", long_options, &option_index);
         if (arg != -1) {
             switch (static_cast<char>(arg)) {
             case 'c':
@@ -355,24 +420,13 @@ int main(int argc, char** argv) {
                 break;
             }
             case 'l': {
-                std::string str_arg(argv[optind++]);
-                str_arg.append(",0"); // FALLBACK: if string is partially completed ("1234,3")
-                                      // this will set all those unset to 0. otherwise we get
-                                      // all 3s.
-                std::stringstream stream(str_arg);
-                std::string sub;
-                std::getline(stream, sub, ',');
-                load_parameters.program_id = std::stoull(sub);
-                std::getline(stream, sub, ',');
-                load_parameters.applet_id = static_cast<Service::AM::AppletId>(std::stoul(sub));
-                std::getline(stream, sub, ',');
-                load_parameters.applet_type = static_cast<Service::AM::AppletType>(std::stoi(sub));
-                std::getline(stream, sub, ',');
-                load_parameters.launch_type = static_cast<Service::AM::LaunchType>(std::stoi(sub));
-                std::getline(stream, sub, ',');
-                load_parameters.program_index = std::stoi(sub);
-                std::getline(stream, sub, ',');
-                load_parameters.previous_program_index = std::stoi(sub);
+                const auto parsed = ParseAppletParameters(optarg != nullptr ? optarg : "");
+                if (!parsed) {
+                    std::cerr << "Invalid --applet-params: expected six comma-separated decimal "
+                                 "integers\n";
+                    return -1;
+                }
+                load_parameters = *parsed;
                 break;
             }
             case 'm': {
@@ -418,6 +472,9 @@ int main(int argc, char** argv) {
             case 'v':
                 PrintVersion();
                 return 0;
+            case '?':
+                PrintHelp(argv[0]);
+                return -1;
             }
         } else {
 #ifdef _WIN32
@@ -729,33 +786,41 @@ int main(int argc, char** argv) {
     system.GetUserChannel().clear();
 
     if (static_cast<u32>(load_parameters.applet_id)) {
-        // code below based off of suyu/main.cpp : GMainWindow::OnHomeMenu()
-        // Inline minimal mapping (AppletIdToProgramId is in an anonymous namespace)
-        const auto applet_id_to_prog_id = [](Service::AM::AppletId id) -> Service::AM::AppletProgramId {
-            using namespace Service::AM;
-            switch (id) {
-            case AppletId::QLaunch:        return AppletProgramId::QLaunch;
-            case AppletId::Starter:        return AppletProgramId::Starter;
-            case AppletId::Auth:           return AppletProgramId::Auth;
-            case AppletId::OverlayDisplay: return AppletProgramId::OverlayDisplay;
-            default:                       return static_cast<AppletProgramId>(0);
+        if (filepath.empty()) {
+            // code below based off of suyu/main.cpp : GMainWindow::OnHomeMenu()
+            // Inline minimal mapping (AppletIdToProgramId is in an anonymous namespace)
+            const auto applet_id_to_prog_id =
+                [](Service::AM::AppletId id) -> Service::AM::AppletProgramId {
+                using namespace Service::AM;
+                switch (id) {
+                case AppletId::QLaunch:
+                    return AppletProgramId::QLaunch;
+                case AppletId::Starter:
+                    return AppletProgramId::Starter;
+                case AppletId::Auth:
+                    return AppletProgramId::Auth;
+                case AppletId::OverlayDisplay:
+                    return AppletProgramId::OverlayDisplay;
+                default:
+                    return static_cast<AppletProgramId>(0);
+                }
+            };
+            const Service::AM::AppletProgramId applet_prog_id =
+                applet_id_to_prog_id(load_parameters.applet_id);
+            auto sysnand = system.GetFileSystemController().GetSystemNANDContents();
+            if (!sysnand) {
+                LOG_CRITICAL(Frontend, "Failed to load applet: Firmware not installed.");
+                return -1;
             }
-        };
-        Service::AM::AppletProgramId applet_prog_id = applet_id_to_prog_id(load_parameters.applet_id);
-        auto sysnand = system.GetFileSystemController().GetSystemNANDContents();
-        if (!sysnand) {
-            LOG_CRITICAL(Frontend, "Failed to load applet: Firmware not installed.");
-            return -1;
-        }
 
-        auto user_applet_nca = sysnand->GetEntry(static_cast<u64>(applet_prog_id),
-                                                 FileSys::ContentRecordType::Program);
-        if (!user_applet_nca) {
-            LOG_CRITICAL(Frontend, "Failed to load applet: applet cannot be found.");
-            return -1;
-        }
-        if (filepath.empty())
+            auto user_applet_nca = sysnand->GetEntry(static_cast<u64>(applet_prog_id),
+                                                     FileSys::ContentRecordType::Program);
+            if (!user_applet_nca) {
+                LOG_CRITICAL(Frontend, "Failed to load applet: applet cannot be found.");
+                return -1;
+            }
             filepath = user_applet_nca->GetFullPath();
+        }
     } else {
         load_parameters.applet_id = Service::AM::AppletId::Application;
     }
