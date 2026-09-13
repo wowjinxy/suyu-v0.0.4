@@ -82,11 +82,13 @@ build/static_recompiler/suyu_recomp inspect-nso \
 Inspection reports checked file and memory ranges, build ID, segment compression and expected
 hashes. NSO0 does not encode whether its instructions are AArch32 or AArch64, so architecture is
 reported as unknown unless `--npdm` supplies a validated `main.npdm`. `--assume-aarch64` explicitly
-opts into entry-point and block discovery for controlled experimentation.
+opts into entry-point, block, MOD0, ELF64 dynamic-table, and RELA discovery for controlled
+experimentation. Missing or malformed dynamic metadata is reported as a nonfatal diagnostic so
+basic NSO inspection remains available.
 
-Required-hash flags are surfaced, but SHA-256 verification is not wired into this first slice;
-JSON therefore reports `required_hashes_verified: false` when verification was requested. Do not
-treat successful decompression alone as an integrity check.
+Every NSO0 segment whose header requires SHA-256 validation is checked after decompression. Both
+human and JSON output distinguish verified hashes from formats that the current build could not
+decode.
 
 `inspect-nso` consumes already-decrypted module bytes. It neither accepts nor manages console
 keys, NSP/XCI/NCA containers, updates, or mods.

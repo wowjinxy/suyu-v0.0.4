@@ -66,12 +66,73 @@ foreach(EXPECTED
         "Architecture: AArch64 (explicit assumption)"
         "Build ID: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         "text: file=0x100 memory=0x1000 decoded=16 stored=16 compression=none"
-        "AArch64 analysis: unavailable (could not validate the conventional AArch64 entry stub and MOD0 header)")
+        "AArch64 analysis: unavailable (could not validate the conventional AArch64 entry stub and MOD0 header)"
+        "ELF64 dynamic analysis: unavailable (MOD0 offset at text+4 is invalid)")
     string(FIND "${INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
     if(EXPECTED_POSITION EQUAL -1)
         message(FATAL_ERROR "Inspection output is missing '${EXPECTED}':\n${INSPECT_OUTPUT}")
     endif()
 endforeach()
+
+set(DYNAMIC_NSO_FIXTURE "${NSO_TEST_DIR}/synthetic-dynamic.nso")
+execute_process(
+    COMMAND "${NSO_TEST_HELPER}" --write-dynamic-fixture "${DYNAMIC_NSO_FIXTURE}"
+    RESULT_VARIABLE DYNAMIC_FIXTURE_RESULT
+    ERROR_VARIABLE DYNAMIC_FIXTURE_ERROR
+)
+if(NOT DYNAMIC_FIXTURE_RESULT EQUAL 0)
+    message(FATAL_ERROR "Could not create dynamic NSO: ${DYNAMIC_FIXTURE_ERROR}")
+endif()
+
+execute_process(
+    COMMAND "${RECOMP_TOOL}" inspect-nso --input "${DYNAMIC_NSO_FIXTURE}" --assume-aarch64
+    RESULT_VARIABLE DYNAMIC_INSPECT_RESULT
+    OUTPUT_VARIABLE DYNAMIC_INSPECT_OUTPUT
+    ERROR_VARIABLE DYNAMIC_INSPECT_ERROR
+)
+if(NOT DYNAMIC_INSPECT_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Dynamic NSO inspection failed: ${DYNAMIC_INSPECT_OUTPUT}${DYNAMIC_INSPECT_ERROR}")
+endif()
+foreach(EXPECTED
+        "AArch64 entry: 0x1010"
+        "ELF64 dynamic: MOD0=0x6000 table=0x6020 non-null-entries=8 bytes=144"
+        "Dynamic symbols: address=0x6180 entry-size=24"
+        "Dynamic RELA: address=0x6100 bytes=24 entries=1 entry-size=24"
+        "PLT RELA: address=0x6118 bytes=24 entries=1 entry-size=24")
+    string(FIND "${DYNAMIC_INSPECT_OUTPUT}" "${EXPECTED}" EXPECTED_POSITION)
+    if(EXPECTED_POSITION EQUAL -1)
+        message(FATAL_ERROR
+            "Dynamic inspection is missing '${EXPECTED}':\n${DYNAMIC_INSPECT_OUTPUT}")
+    endif()
+endforeach()
+
+execute_process(
+    COMMAND "${RECOMP_TOOL}" inspect-nso --input "${DYNAMIC_NSO_FIXTURE}"
+            --assume-aarch64 --json
+    RESULT_VARIABLE DYNAMIC_JSON_RESULT
+    OUTPUT_VARIABLE DYNAMIC_JSON_OUTPUT
+    ERROR_VARIABLE DYNAMIC_JSON_ERROR
+)
+if(NOT DYNAMIC_JSON_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Dynamic JSON inspection failed: ${DYNAMIC_JSON_OUTPUT}${DYNAMIC_JSON_ERROR}")
+endif()
+string(JSON DYNAMIC_ANALYSIS_TYPE TYPE "${DYNAMIC_JSON_OUTPUT}" dynamic_analysis)
+string(JSON DYNAMIC_FORMAT GET "${DYNAMIC_JSON_OUTPUT}" dynamic_analysis format)
+string(JSON DYNAMIC_MOD0 GET "${DYNAMIC_JSON_OUTPUT}" dynamic_analysis mod0 address)
+string(JSON DYNAMIC_RELA_ENTRIES_TYPE TYPE "${DYNAMIC_JSON_OUTPUT}"
+       dynamic_analysis rela entries)
+string(JSON DYNAMIC_RELA_ENTRIES GET "${DYNAMIC_JSON_OUTPUT}" dynamic_analysis rela entries)
+string(JSON DYNAMIC_PLT_ENTRIES GET "${DYNAMIC_JSON_OUTPUT}" dynamic_analysis plt_rela entries)
+if(NOT DYNAMIC_ANALYSIS_TYPE STREQUAL "OBJECT" OR
+   NOT DYNAMIC_FORMAT STREQUAL "ELF64" OR
+   NOT DYNAMIC_MOD0 STREQUAL "0x6000" OR
+   NOT DYNAMIC_RELA_ENTRIES_TYPE STREQUAL "NUMBER" OR
+   NOT DYNAMIC_RELA_ENTRIES EQUAL 1 OR
+   NOT DYNAMIC_PLT_ENTRIES EQUAL 1)
+    message(FATAL_ERROR "Dynamic JSON schema is invalid:\n${DYNAMIC_JSON_OUTPUT}")
+endif()
 
 set(LZ4_NSO_FIXTURE "${NSO_TEST_DIR}/synthetic-lz4.nso")
 execute_process(
@@ -120,3 +181,27 @@ foreach(EXPECTED
         message(FATAL_ERROR "JSON output is missing '${EXPECTED}':\n${JSON_OUTPUT}")
     endif()
 endforeach()
+
+string(JSON UNKNOWN_DYNAMIC_TYPE TYPE "${JSON_OUTPUT}" dynamic_analysis)
+if(NOT UNKNOWN_DYNAMIC_TYPE STREQUAL "NULL")
+    message(FATAL_ERROR "Unknown-architecture dynamic analysis must be null:\n${JSON_OUTPUT}")
+endif()
+
+execute_process(
+    COMMAND "${RECOMP_TOOL}" inspect-nso --input "${NSO_FIXTURE}" --assume-aarch64 --json
+    RESULT_VARIABLE UNAVAILABLE_JSON_RESULT
+    OUTPUT_VARIABLE UNAVAILABLE_JSON_OUTPUT
+    ERROR_VARIABLE UNAVAILABLE_JSON_ERROR
+)
+if(NOT UNAVAILABLE_JSON_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Unavailable dynamic JSON inspection became fatal: "
+        "${UNAVAILABLE_JSON_OUTPUT}${UNAVAILABLE_JSON_ERROR}")
+endif()
+string(JSON UNAVAILABLE_DYNAMIC_TYPE TYPE "${UNAVAILABLE_JSON_OUTPUT}" dynamic_analysis)
+string(JSON UNAVAILABLE_DYNAMIC_ERROR GET "${UNAVAILABLE_JSON_OUTPUT}" dynamic_analysis error)
+string(FIND "${UNAVAILABLE_DYNAMIC_ERROR}" "MOD0" UNAVAILABLE_MOD0_POSITION)
+if(NOT UNAVAILABLE_DYNAMIC_TYPE STREQUAL "OBJECT" OR UNAVAILABLE_MOD0_POSITION EQUAL -1)
+    message(FATAL_ERROR
+        "Unavailable dynamic JSON analysis lacks its diagnostic object:\n${UNAVAILABLE_JSON_OUTPUT}")
+endif()

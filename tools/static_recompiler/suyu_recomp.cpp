@@ -3,6 +3,7 @@
 
 #include "core/recompiler/arm64_to_c.h"
 #include "core/recompiler/npdm_info.h"
+#include "core/recompiler/nso_dynamic.h"
 #include "core/recompiler/nso_image.h"
 #include "nso_sha256.h"
 
@@ -668,6 +669,23 @@ int InspectNso(const Options& options) {
     const bool analyze_aarch64 =
         options.assume_aarch64 ||
         (npdm && npdm->info.architecture == suyu::recomp::NpdmArchitecture::Aarch64);
+
+    std::optional<suyu::recomp::NsoDynamicInfo> dynamic_info;
+    std::string dynamic_error;
+    if (analyze_aarch64) {
+        if (!decoded) {
+            dynamic_error = decoded.error;
+        } else {
+            auto dynamic = suyu::recomp::ParseNsoDynamic(*decoded.image);
+            warnings.insert(warnings.end(), dynamic.warnings.begin(), dynamic.warnings.end());
+            if (dynamic) {
+                dynamic_info = std::move(*dynamic.info);
+            } else {
+                dynamic_error = std::move(dynamic.error);
+            }
+        }
+    }
+
     if (analyze_aarch64) {
         if (!decoded) {
             aarch64_error = decoded.error;
@@ -753,6 +771,42 @@ int InspectNso(const Options& options) {
             } else {
                 std::cout << "AArch64 analysis: unavailable (" << aarch64_error << ")\n";
             }
+
+            if (dynamic_info) {
+                std::cout << "ELF64 dynamic: MOD0=" << Hex(dynamic_info->mod0.address)
+                          << " table=" << Hex(dynamic_info->dynamic_address)
+                          << " non-null-entries=" << dynamic_info->entries.size()
+                          << " bytes=" << dynamic_info->dynamic_byte_size << '\n';
+                if (dynamic_info->string_table_address && dynamic_info->string_table_size) {
+                    std::cout << "Dynamic strings: address="
+                              << Hex(*dynamic_info->string_table_address)
+                              << " bytes=" << *dynamic_info->string_table_size << '\n';
+                } else {
+                    std::cout << "Dynamic strings: none\n";
+                }
+                if (dynamic_info->symbol_table_address) {
+                    std::cout << "Dynamic symbols: address="
+                              << Hex(*dynamic_info->symbol_table_address)
+                              << " entry-size=" << dynamic_info->symbol_entry_size << '\n';
+                } else {
+                    std::cout << "Dynamic symbols: none\n";
+                }
+                const auto print_rela = [](std::string_view label,
+                                           const std::optional<suyu::recomp::NsoRelaTable>& table) {
+                    std::cout << label << ": ";
+                    if (!table) {
+                        std::cout << "none\n";
+                        return;
+                    }
+                    std::cout << "address=" << Hex(table->address) << " bytes=" << table->byte_size
+                              << " entries=" << table->records.size()
+                              << " entry-size=" << table->entry_size << '\n';
+                };
+                print_rela("Dynamic RELA", dynamic_info->rela);
+                print_rela("PLT RELA", dynamic_info->plt_rela);
+            } else {
+                std::cout << "ELF64 dynamic analysis: unavailable (" << dynamic_error << ")\n";
+            }
         }
         for (const std::string& warning : warnings) {
             std::cout << "Warning: " << warning << '\n';
@@ -830,6 +884,58 @@ int InspectNso(const Options& options) {
         std::cout << "{\"entry\": \"" << Hex(*aarch64_entry)
                   << "\", \"blocks\": " << aarch64_blocks.size()
                   << ", \"instruction_words\": " << decoded.image->segments[0].size() / 4 << "},\n";
+    }
+    std::cout << "  \"dynamic_analysis\": ";
+    if (!analyze_aarch64) {
+        std::cout << "null,\n";
+    } else if (!dynamic_info) {
+        std::cout << "{\"error\": \"" << JsonEscape(dynamic_error) << "\"},\n";
+    } else {
+        const auto print_optional_table =
+            [](const std::optional<suyu::recomp::NsoRelaTable>& table) {
+                if (!table) {
+                    std::cout << "null";
+                    return;
+                }
+                std::cout << "{\"address\": \"" << Hex(table->address)
+                          << "\", \"byte_size\": " << table->byte_size
+                          << ", \"entry_size\": " << table->entry_size
+                          << ", \"entries\": " << table->records.size() << '}';
+            };
+        std::cout << "{\"format\": \"ELF64\", \"mod0\": {\"address\": \""
+                  << Hex(dynamic_info->mod0.address) << "\", \"dynamic_offset\": \""
+                  << Hex(dynamic_info->mod0.dynamic_offset) << "\", \"bss_start_offset\": \""
+                  << Hex(dynamic_info->mod0.bss_start_offset) << "\", \"bss_end_offset\": \""
+                  << Hex(dynamic_info->mod0.bss_end_offset)
+                  << "\", \"exception_info_start_offset\": \""
+                  << Hex(dynamic_info->mod0.exception_info_start_offset)
+                  << "\", \"exception_info_end_offset\": \""
+                  << Hex(dynamic_info->mod0.exception_info_end_offset)
+                  << "\", \"module_object_offset\": \""
+                  << Hex(dynamic_info->mod0.module_object_offset)
+                  << "\"}, \"dynamic_table\": {\"address\": \""
+                  << Hex(dynamic_info->dynamic_address)
+                  << "\", \"byte_size\": " << dynamic_info->dynamic_byte_size
+                  << ", \"non_null_entries\": " << dynamic_info->entries.size()
+                  << "}, \"string_table\": ";
+        if (dynamic_info->string_table_address && dynamic_info->string_table_size) {
+            std::cout << "{\"address\": \"" << Hex(*dynamic_info->string_table_address)
+                      << "\", \"byte_size\": " << *dynamic_info->string_table_size << '}';
+        } else {
+            std::cout << "null";
+        }
+        std::cout << ", \"symbol_table\": ";
+        if (dynamic_info->symbol_table_address) {
+            std::cout << "{\"address\": \"" << Hex(*dynamic_info->symbol_table_address)
+                      << "\", \"entry_size\": " << dynamic_info->symbol_entry_size << '}';
+        } else {
+            std::cout << "null";
+        }
+        std::cout << ", \"rela\": ";
+        print_optional_table(dynamic_info->rela);
+        std::cout << ", \"plt_rela\": ";
+        print_optional_table(dynamic_info->plt_rela);
+        std::cout << "},\n";
     }
     std::cout << "  \"warnings\": [";
     for (std::size_t i = 0; i < warnings.size(); ++i) {

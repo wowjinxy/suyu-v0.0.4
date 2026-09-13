@@ -28,6 +28,12 @@ void PutU32(std::vector<Byte>& bytes, std::size_t offset, std::uint32_t value) {
     bytes[offset + 3] = static_cast<Byte>(value >> 24);
 }
 
+void PutU64(std::vector<Byte>& bytes, std::size_t offset, std::uint64_t value) {
+    for (std::size_t i = 0; i < sizeof(value); ++i) {
+        bytes[offset + i] = static_cast<Byte>(value >> (i * 8));
+    }
+}
+
 std::vector<Byte> MakeNso() {
     std::vector<Byte> bytes(0x120);
     std::copy_n(reinterpret_cast<const Byte*>("NSO0"), 4, bytes.begin());
@@ -123,6 +129,84 @@ std::vector<Byte> MakeEmittableNso() {
     }
     bytes[0x168] = 5;
     bytes[0x170] = 7;
+    return bytes;
+}
+
+std::vector<Byte> MakeDynamicNso() {
+    constexpr std::uint32_t TextFile = 0x100;
+    constexpr std::uint32_t TextAddress = 0x1000;
+    constexpr std::uint32_t TextSize = 0x20;
+    constexpr std::uint32_t RoDataFile = TextFile + TextSize;
+    constexpr std::uint32_t RoDataAddress = 0x6000;
+    constexpr std::uint32_t RoDataSize = 0x200;
+    constexpr std::uint32_t DataFile = RoDataFile + RoDataSize;
+    constexpr std::uint32_t DataAddress = 0x8000;
+    constexpr std::uint32_t DataSize = 8;
+    constexpr std::uint32_t DynamicAddress = RoDataAddress + 0x20;
+    constexpr std::uint32_t RelaAddress = RoDataAddress + 0x100;
+    constexpr std::uint32_t PltRelaAddress = RelaAddress + 0x18;
+    constexpr std::uint32_t SymbolTableAddress = RoDataAddress + 0x180;
+
+    std::vector<Byte> bytes(DataFile + DataSize);
+    std::copy_n(reinterpret_cast<const Byte*>("NSO0"), 4, bytes.begin());
+    PutU32(bytes, 0x10, TextFile);
+    PutU32(bytes, 0x14, TextAddress);
+    PutU32(bytes, 0x18, TextSize);
+    PutU32(bytes, 0x20, RoDataFile);
+    PutU32(bytes, 0x24, RoDataAddress);
+    PutU32(bytes, 0x28, RoDataSize);
+    PutU32(bytes, 0x30, DataFile);
+    PutU32(bytes, 0x34, DataAddress);
+    PutU32(bytes, 0x38, DataSize);
+    PutU32(bytes, 0x3C, 0x20); // BSS
+    PutU32(bytes, 0x60, TextSize);
+    PutU32(bytes, 0x64, RoDataSize);
+    PutU32(bytes, 0x68, DataSize);
+    for (std::size_t i = 0; i < 0x20; ++i) {
+        bytes[0x40 + i] = static_cast<Byte>(0x40 + i);
+    }
+
+    PutU32(bytes, TextFile, 0x14000004); // b text+0x10
+    PutU32(bytes, TextFile + 4, RoDataAddress - TextAddress);
+    PutU32(bytes, TextFile + 0x10, 0xD65F03C0); // ret
+
+    const auto ro_file_offset = [](std::uint32_t address) {
+        return static_cast<std::size_t>(RoDataFile + address - RoDataAddress);
+    };
+    std::copy_n(reinterpret_cast<const Byte*>("MOD0"), 4,
+                bytes.begin() + ro_file_offset(RoDataAddress));
+    PutU32(bytes, ro_file_offset(RoDataAddress) + 4, DynamicAddress - RoDataAddress);
+    PutU32(bytes, ro_file_offset(RoDataAddress) + 8, DataAddress - RoDataAddress + DataSize);
+    PutU32(bytes, ro_file_offset(RoDataAddress) + 12,
+           DataAddress - RoDataAddress + DataSize + 0x20);
+    PutU32(bytes, ro_file_offset(RoDataAddress) + 24, DataAddress - RoDataAddress);
+
+    const auto put_dynamic = [&](std::size_t index, std::int64_t tag, std::uint64_t value) {
+        const std::size_t offset = ro_file_offset(DynamicAddress) + index * 16;
+        PutU64(bytes, offset, static_cast<std::uint64_t>(tag));
+        PutU64(bytes, offset + 8, value);
+    };
+    put_dynamic(0, 7, RelaAddress);        // DT_RELA
+    put_dynamic(1, 8, 24);                 // DT_RELASZ
+    put_dynamic(2, 9, 24);                 // DT_RELAENT
+    put_dynamic(3, 23, PltRelaAddress);    // DT_JMPREL
+    put_dynamic(4, 2, 24);                 // DT_PLTRELSZ
+    put_dynamic(5, 20, 7);                 // DT_PLTREL = DT_RELA
+    put_dynamic(6, 6, SymbolTableAddress); // DT_SYMTAB
+    put_dynamic(7, 11, 24);                // DT_SYMENT
+    put_dynamic(8, 0, 0);                  // DT_NULL
+
+    const auto put_rela = [&](std::uint32_t address, std::uint64_t target, std::uint32_t symbol,
+                              std::uint32_t type, std::int64_t addend) {
+        const std::size_t offset = ro_file_offset(address);
+        PutU64(bytes, offset, target);
+        PutU64(bytes, offset + 8, (static_cast<std::uint64_t>(symbol) << 32) | type);
+        PutU64(bytes, offset + 16, static_cast<std::uint64_t>(addend));
+    };
+    put_rela(RelaAddress, DataAddress, 0, 0x403, TextAddress + 0x10);
+    put_rela(PltRelaAddress, DataAddress + DataSize, 1, 0x402, 0);
+    // Leave complete, readable null and index-one ELF64 symbol entries in rodata.
+
     return bytes;
 }
 
@@ -560,6 +644,8 @@ int main(int argc, char** argv) {
             fixture = MakeLz4Nso();
         } else if (operation == "--write-emittable-fixture") {
             fixture = MakeEmittableNso();
+        } else if (operation == "--write-dynamic-fixture") {
+            fixture = MakeDynamicNso();
         } else if (operation == "--write-misaligned-emittable-fixture") {
             fixture = MakeEmittableNso();
             PutU32(*fixture, 0x14, 0x1004);
