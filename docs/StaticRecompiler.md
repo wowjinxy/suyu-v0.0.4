@@ -53,6 +53,8 @@ rasterizer, and runtime shader translation.
 - Completed slice: `emit-nso` decodes the three segments, validates a conventional MOD0/AArch64
   entry, rejects AArch32, and emits an address-correct C project behind an NPDM or explicit
   assumption gate.
+- Real-module validation resolves the entry stub's module-relative MOD0 pointer across text,
+  rodata, and data; MOD0 is not assumed to reside beside the entry code.
 - Move exported-symbol roots, relocation roots, and code-pointer scanning out of the Qt exporter.
 - Key output by build ID plus hashes of the post-update, post-mod decompressed segments.
 - Keep decryption/key management outside the recompiler core.

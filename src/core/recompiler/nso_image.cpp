@@ -52,6 +52,59 @@ bool ValidateRoExtent(const NsoRelativeExtent& extent, std::uint32_t rodata_size
     return true;
 }
 
+std::uint32_t FindNsoAarch64EntryOffsetImpl(
+    std::span<const std::uint8_t> text,
+    const std::array<std::uint32_t, NsoSegmentCount>& memory_offsets,
+    const std::array<std::span<const std::uint8_t>, NsoSegmentCount>& segments) {
+    if (text.size() < 8) {
+        return 0;
+    }
+
+    constexpr std::uint64_t MinimumMod0HeaderSize = 0x1C;
+    constexpr std::uint32_t Mod0Magic = 0x30444F4D; // "MOD0", little-endian
+    const std::uint32_t mod0_offset = ReadU32(text, 4);
+    if ((mod0_offset & 3) != 0) {
+        return 0;
+    }
+    const std::uint64_t mod0_address =
+        static_cast<std::uint64_t>(memory_offsets[static_cast<std::size_t>(NsoSegmentId::Text)]) +
+        mod0_offset;
+    std::size_t mod0_segment = NsoSegmentCount;
+    std::uint64_t mod0_local_offset = 0;
+    for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+        if (mod0_address < memory_offsets[i]) {
+            continue;
+        }
+        const std::uint64_t local_offset =
+            static_cast<std::uint64_t>(mod0_address) - memory_offsets[i];
+        if (RangeFits(local_offset, MinimumMod0HeaderSize, segments[i].size()) &&
+            ReadU32(segments[i], static_cast<std::size_t>(local_offset)) == Mod0Magic) {
+            mod0_segment = i;
+            mod0_local_offset = local_offset;
+            break;
+        }
+    }
+    if (mod0_segment == NsoSegmentCount) {
+        return 0;
+    }
+
+    const std::uint32_t instruction = ReadU32(text, 0);
+    if ((instruction & 0xFC000000) != 0x14000000) { // B imm26
+        return 0;
+    }
+    const std::int32_t immediate = static_cast<std::int32_t>(instruction << 6) >> 6;
+    const std::int64_t target = static_cast<std::int64_t>(immediate) * 4;
+    if (target < 8 || !RangeFits(static_cast<std::uint64_t>(target), 4, text.size())) {
+        return 0;
+    }
+    if (mod0_segment == static_cast<std::size_t>(NsoSegmentId::Text) &&
+        RangesOverlap(static_cast<std::uint64_t>(target), 4, mod0_local_offset,
+                      MinimumMod0HeaderSize)) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(target);
+}
+
 } // namespace
 
 NsoInspection InspectNso(std::span<const std::uint8_t> file) {
@@ -302,29 +355,21 @@ NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file, NsoDecompressor lz
 }
 
 std::uint32_t FindNsoAarch64EntryOffset(std::span<const std::uint8_t> text) {
-    if (text.size() < 8) {
-        return 0;
-    }
-    const std::uint32_t mod0_offset = ReadU32(text, 4);
-    constexpr std::uint64_t MinimumMod0HeaderSize = 0x1C;
-    constexpr std::uint32_t Mod0Magic = 0x30444F4D; // "MOD0", little-endian
-    if ((mod0_offset & 3) != 0 || !RangeFits(mod0_offset, MinimumMod0HeaderSize, text.size()) ||
-        ReadU32(text, mod0_offset) != Mod0Magic) {
-        return 0;
-    }
+    const std::array<std::uint32_t, NsoSegmentCount> memory_offsets{};
+    const std::array<std::span<const std::uint8_t>, NsoSegmentCount> segments{
+        text, std::span<const std::uint8_t>{}, std::span<const std::uint8_t>{}};
+    return FindNsoAarch64EntryOffsetImpl(text, memory_offsets, segments);
+}
 
-    const std::uint32_t instruction = ReadU32(text, 0);
-    if ((instruction & 0xFC000000) != 0x14000000) { // B imm26
-        return 0;
+std::uint32_t FindNsoAarch64EntryOffset(const DecodedNso& image) {
+    std::array<std::uint32_t, NsoSegmentCount> memory_offsets{};
+    std::array<std::span<const std::uint8_t>, NsoSegmentCount> segments{};
+    for (std::size_t i = 0; i < NsoSegmentCount; ++i) {
+        memory_offsets[i] = image.info.segments[i].memory_offset;
+        segments[i] = image.segments[i];
     }
-    const std::int32_t immediate = static_cast<std::int32_t>(instruction << 6) >> 6;
-    const std::int64_t target = static_cast<std::int64_t>(immediate) * 4;
-    const std::uint64_t mod0_end = static_cast<std::uint64_t>(mod0_offset) + MinimumMod0HeaderSize;
-    if (target < 0 || static_cast<std::uint64_t>(target) < mod0_end ||
-        !RangeFits(static_cast<std::uint64_t>(target), 4, text.size())) {
-        return 0;
-    }
-    return static_cast<std::uint32_t>(target);
+    return FindNsoAarch64EntryOffsetImpl(segments[static_cast<std::size_t>(NsoSegmentId::Text)],
+                                         memory_offsets, segments);
 }
 
 std::string NsoBuildIdToHex(const std::array<std::uint8_t, 0x20>& build_id) {

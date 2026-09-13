@@ -306,6 +306,18 @@ void RunTests() {
     Check(suyu::recomp::FindNsoAarch64EntryOffset(fake_mod0) == 0,
           "entry probe rejects a branch into the MOD0 header");
 
+    suyu::recomp::DecodedNso split_mod0{};
+    split_mod0.info.segments[0].memory_offset = 0x1000;
+    split_mod0.info.segments[1].memory_offset = 0x3000;
+    split_mod0.info.segments[2].memory_offset = 0x4000;
+    split_mod0.segments[0].resize(0x10);
+    split_mod0.segments[1].resize(0x1C);
+    PutU32(split_mod0.segments[0], 0, 0x14000002); // b text+8
+    PutU32(split_mod0.segments[0], 4, 0x2000);
+    std::copy_n(reinterpret_cast<const Byte*>("MOD0"), 4, split_mod0.segments[1].begin());
+    Check(suyu::recomp::FindNsoAarch64EntryOffset(split_mod0) == 8,
+          "entry probe resolves a module-relative MOD0 pointer into rodata");
+
     // HOS 19+ extends MOD0 from 0x1c to 0x34 bytes. Nonzero extension fields must
     // not be mistaken for code; the entry-stub branch is the authoritative
     // target.

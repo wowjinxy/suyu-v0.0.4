@@ -111,6 +111,10 @@ NsoDecodeResult DecodeNso(std::span<const std::uint8_t> file,
 /// architecture assumption; NSO0 itself has no ISA field.
 std::uint32_t FindNsoAarch64EntryOffset(std::span<const std::uint8_t> text);
 
+/// As above, but resolves the module-relative MOD0 pointer across every decoded NSO segment.
+/// Retail modules commonly place MOD0 in rodata rather than beside the entry stub in text.
+std::uint32_t FindNsoAarch64EntryOffset(const DecodedNso& image);
+
 std::string NsoBuildIdToHex(const std::array<std::uint8_t, 0x20>& build_id);
 const char* NsoSegmentName(NsoSegmentId segment);
 const char* NsoCompressionName(NsoCompression compression);

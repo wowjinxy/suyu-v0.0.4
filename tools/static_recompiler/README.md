@@ -61,7 +61,8 @@ build/static_recompiler/suyu_recomp emit-nso \
 refuses AArch32 because the current translator is AArch64-only. `--assume-aarch64` is available for
 controlled experiments without an NPDM and prints an explicit warning. The generated standalone
 loader requires a 64-bit host, enforces the page-aligned text/rodata/data order, preserves those
-virtual addresses, checks bundled file sizes, and zeros BSS.
+virtual addresses, resolves module-relative MOD0 pointers across all three segments, checks bundled
+file sizes, and zeros BSS.
 
 This output is a translation project, not yet a self-contained replacement for a Switch runtime.
 Imports and relocations still require the hosted suyu loader, and the standalone services remain

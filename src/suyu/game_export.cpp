@@ -872,15 +872,15 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     result.data_vaddr = info.segments[2].memory_offset;
     result.data_size = info.segments[2].decoded_size;
     result.bss_size = info.bss_size;
-    result.text_bytes = std::move(decoded.image->segments[0]);
-    result.rodata_bytes = std::move(decoded.image->segments[1]);
-    result.data_bytes = std::move(decoded.image->segments[2]);
-    const u32 entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(result.text_bytes);
+    const u32 entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(*decoded.image);
     if (entry_offset == 0) {
         LOG_WARNING(Frontend, "Could not validate the AArch64 entry stub in NSO {}",
                     nso_file->GetName());
         return std::nullopt;
     }
+    result.text_bytes = std::move(decoded.image->segments[0]);
+    result.rodata_bytes = std::move(decoded.image->segments[1]);
+    result.data_bytes = std::move(decoded.image->segments[2]);
     result.entry_vaddr = static_cast<u64>(result.text_vaddr) + entry_offset;
 
     // Use the same block discovery implementation as the CLI and emitter. The old frontend-local

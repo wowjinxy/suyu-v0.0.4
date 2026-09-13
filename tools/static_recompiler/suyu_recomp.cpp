@@ -672,7 +672,8 @@ int InspectNso(const Options& options) {
             if (text.empty() || (text.size() & 3) != 0 || (base & 3) != 0) {
                 aarch64_error = "text must be non-empty, four-byte aligned, and word-sized";
             } else {
-                const std::uint32_t entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(text);
+                const std::uint32_t entry_offset =
+                    suyu::recomp::FindNsoAarch64EntryOffset(*decoded.image);
                 if (entry_offset == 0) {
                     aarch64_error =
                         "could not validate the conventional AArch64 entry stub and MOD0 header";
@@ -884,7 +885,7 @@ int EmitNso(const Options& options) {
                      "aligned\n";
         return 1;
     }
-    const std::uint32_t entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(text);
+    const std::uint32_t entry_offset = suyu::recomp::FindNsoAarch64EntryOffset(*decoded.image);
     if (entry_offset == 0) {
         std::cerr << "error: could not validate the conventional AArch64 NSO entry "
                      "stub and MOD0 "
