@@ -205,6 +205,34 @@ string(FIND "${generated_cmake}" "CMAKE_SIZEOF_VOID_P EQUAL 8" host_width_positi
 if(host_width_position EQUAL -1)
     message(FATAL_ERROR "Generated project does not require a 64-bit host")
 endif()
+foreach(rename
+        "recomp_image_build_id=recomp_image_build_id_main"
+        "recomp_image_text_sha256=recomp_image_text_sha256_main"
+        "recomp_image_text_size=recomp_image_text_size_main")
+    string(FIND "${generated_cmake}" "${rename}" identity_rename_position)
+    if(identity_rename_position EQUAL -1)
+        message(FATAL_ERROR "Generated static target does not contain rename '${rename}'")
+    endif()
+endforeach()
+
+file(READ "${generated_dir}/recomp_export.c" generated_export)
+foreach(expected
+        "static const uint8_t g_recomp_image_build_id[32]"
+        "0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87"
+        "0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f"
+        "RECOMP_API const uint8_t* recomp_image_build_id(void){ return g_recomp_image_build_id; }"
+        "static const uint8_t g_recomp_image_text_sha256[32]"
+        "0x63, 0xa2, 0xc5, 0xb7, 0x00, 0x5e, 0xf5, 0x8b"
+        "0xb8, 0x7f, 0x25, 0x3c, 0x70, 0x92, 0xd1, 0x3b"
+        "0x89, 0x06, 0x0b, 0x7d, 0x6f, 0xe2, 0xbc, 0x48"
+        "0x52, 0xc9, 0xbb, 0xb0, 0x30, 0xb0, 0x44, 0x5d"
+        "RECOMP_API const uint8_t* recomp_image_text_sha256(void){ return g_recomp_image_text_sha256; }"
+        "RECOMP_API uint64_t recomp_image_text_size(void){ return 0x1000ULL; }")
+    string(FIND "${generated_export}" "${expected}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR "Generated export is missing '${expected}'")
+    endif()
+endforeach()
 
 execute_process(
     COMMAND "${RECOMP_TOOL}" emit-nso
@@ -237,7 +265,8 @@ if(NOT configure_result EQUAL 0)
         "Generated NSO project configure failed (${configure_result})\n${configure_stdout}\n${configure_stderr}")
 endif()
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build "${build_dir}" --config Release --target recompiled
+    COMMAND "${CMAKE_COMMAND}" --build "${build_dir}" --config Release
+        --target recompiled recompiled_image recomp_static_main
     RESULT_VARIABLE build_result
     OUTPUT_VARIABLE build_stdout
     ERROR_VARIABLE build_stderr

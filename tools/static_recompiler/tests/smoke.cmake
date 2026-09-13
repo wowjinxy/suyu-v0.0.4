@@ -51,6 +51,16 @@ foreach(generated_file
     endif()
 endforeach()
 
+file(READ "${generated_dir}/recomp_export.c" generated_export)
+string(REGEX MATCHALL "0x00" zero_identity_bytes "${generated_export}")
+list(LENGTH zero_identity_bytes zero_identity_size)
+if(NOT zero_identity_size EQUAL 64 OR
+   NOT generated_export MATCHES "recomp_image_build_id\\(void\\)" OR
+   NOT generated_export MATCHES "recomp_image_text_sha256\\(void\\)" OR
+   NOT generated_export MATCHES "recomp_image_text_size\\(void\\)\\{ return 0x0ULL; \\}")
+    message(FATAL_ERROR "Raw-image export does not expose zero identity metadata")
+endif()
+
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E compare_files
         "${RECOMP_FIXTURE}" "${generated_dir}/data/text.bin"
@@ -78,7 +88,8 @@ if(NOT configure_result EQUAL 0)
 endif()
 
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build "${build_dir}" --config Release --target recompiled
+    COMMAND "${CMAKE_COMMAND}" --build "${build_dir}" --config Release
+        --target recompiled recompiled_smoke
     RESULT_VARIABLE build_result
     OUTPUT_VARIABLE build_stdout
     ERROR_VARIABLE build_stderr

@@ -253,8 +253,8 @@ Kernel::KProcessAddress GetModuleEnd(const Kernel::KProcess* process,
     return cur_addr - 1;
 }
 
-std::optional<u64> GetNsoModuleImageSize(const Kernel::KProcess* process,
-                                         Kernel::KProcessAddress base) {
+std::optional<NsoModuleImageLayout> GetNsoModuleImageLayout(const Kernel::KProcess* process,
+                                                            Kernel::KProcessAddress base) {
     if (process == nullptr) {
         return std::nullopt;
     }
@@ -322,7 +322,16 @@ std::optional<u64> GetNsoModuleImageSize(const Kernel::KProcess* process,
         return std::nullopt;
     }
 
-    return data->end - module_base;
+    return NsoModuleImageLayout{
+        .image_size = data->end - module_base,
+        .text_size = text->end - module_base,
+    };
+}
+
+std::optional<u64> GetNsoModuleImageSize(const Kernel::KProcess* process,
+                                         Kernel::KProcessAddress base) {
+    const auto layout = GetNsoModuleImageLayout(process, base);
+    return layout ? std::optional<u64>{layout->image_size} : std::nullopt;
 }
 
 Loader::AppLoader::Modules FindModules(Kernel::KProcess* process) {

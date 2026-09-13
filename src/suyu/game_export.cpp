@@ -30,6 +30,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -582,6 +583,9 @@ struct Arm64BasicBlock {
 struct NsoAnalysisResult {
     QString name;
     QString build_id_hex;
+    std::array<u8, 0x20> build_id{};
+    std::array<u8, 0x20> text_sha256{};
+    u64 mapped_text_size{};
     u32 text_vaddr{};
     u32 text_size{};
     u32 rodata_vaddr{};
@@ -880,6 +884,7 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     NsoAnalysisResult result{};
     result.name = QString::fromStdString(nso_file->GetName());
     result.build_id_hex = QString::fromStdString(suyu::recomp::NsoBuildIdToHex(info.build_id));
+    result.build_id = info.build_id;
 
     // Extract segment metadata
     result.text_vaddr = info.segments[0].memory_offset;
@@ -899,6 +904,18 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     result.rodata_bytes = std::move(decoded.image->segments[1]);
     result.data_bytes = std::move(decoded.image->segments[2]);
     result.entry_vaddr = static_cast<u64>(result.text_vaddr) + entry_offset;
+
+    constexpr std::size_t TextPageSize = 0x1000;
+    const std::size_t mapped_text_size =
+        (result.text_bytes.size() + TextPageSize - 1) & ~(TextPageSize - 1);
+    std::vector<u8> mapped_text{result.text_bytes};
+    mapped_text.resize(mapped_text_size, 0);
+    if (!ComputeNsoSha256(mapped_text, result.text_sha256)) {
+        LOG_WARNING(Frontend, "Could not hash the page-aligned text image in NSO {}",
+                    nso_file->GetName());
+        return std::nullopt;
+    }
+    result.mapped_text_size = static_cast<u64>(mapped_text_size);
 
     // Use the same block discovery implementation as the CLI and emitter. The old frontend-local
     // sweep missed conditional branch targets and could therefore report a different block map.
@@ -1596,7 +1613,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 mod.data_bytes.empty() ? nullptr : mod.data_bytes.data(), mod.data_bytes.size(),
                 mod.entry_vaddr, game_name.toStdString(), &exported_roots,
                 suyu::recomp::RecompileImageLayout{mod.rodata_vaddr, mod.data_vaddr,
-                                                   mod.bss_size});
+                                                   mod.bss_size},
+                &mod.build_id, &mod.text_sha256, mod.mapped_text_size);
             emit_ok = true;
         } catch (const std::exception& e) {
             LOG_ERROR(Frontend, "EmitProject failed for module {}: {}", mod.name.toStdString(),
@@ -1797,20 +1815,28 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             for (const auto& m : ordered) {
                 o << "extern SuyuRecompBlockFn recomp_image_lookup_" << m << "(uint64_t);\n"
                   << "extern void recomp_image_set_base_" << m << "(uint64_t);\n"
+                  << "extern const uint8_t* recomp_image_build_id_" << m << "(void);\n"
+                  << "extern const uint8_t* recomp_image_text_sha256_" << m << "(void);\n"
+                  << "extern uint64_t recomp_image_text_size_" << m << "(void);\n"
                   << "extern uint64_t g_module_base_" << m << ";\n";
             }
             o << "\ntypedef struct {\n"
                  "    const char* name;\n"
                  "    SuyuRecompBlockFn (*lookup)(uint64_t);\n"
                  "    void (*set_base)(uint64_t);\n"
+                 "    const uint8_t* (*build_id)(void);\n"
+                 "    const uint8_t* (*text_sha256)(void);\n"
+                 "    uint64_t (*text_size)(void);\n"
                  "} SuyuRecompStaticModule;\n\n"
                  "static const SuyuRecompStaticModule s_modules[] = {\n";
             for (const auto& m : ordered) {
                 o << "    { \"" << m << "\", recomp_image_lookup_" << m
-                  << ", recomp_image_set_base_" << m << " },\n";
+                  << ", recomp_image_set_base_" << m << ", recomp_image_build_id_" << m
+                  << ", recomp_image_text_sha256_" << m << ", recomp_image_text_size_" << m
+                  << " },\n";
             }
             o << "};\n\n"
-                 "const SuyuRecompStaticModule* suyu_recomp_static_modules(unsigned* count) {\n"
+                 "const SuyuRecompStaticModule* suyu_recomp_static_modules_v2(unsigned* count) {\n"
                  "    *count = (unsigned)(sizeof(s_modules) / sizeof(s_modules[0]));\n"
                  "    return s_modules;\n"
                  "}\n";

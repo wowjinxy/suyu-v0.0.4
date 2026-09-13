@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <exception>
@@ -91,9 +92,12 @@ struct SuyuRecompStaticModule {
     const char* name;
     void (*(*lookup)(u64))(void*);
     void (*set_base)(u64);
+    const u8* (*build_id)();
+    const u8* (*text_sha256)();
+    u64 (*text_size)();
 };
 #ifdef SUYU_CMD_STATIC_RECOMP
-const SuyuRecompStaticModule* suyu_recomp_static_modules(unsigned* count);
+const SuyuRecompStaticModule* suyu_recomp_static_modules_v2(unsigned* count);
 #endif
 }
 
@@ -500,6 +504,10 @@ int main(int argc, char** argv) {
     struct RecompModule {
         Core::RecompBlockFn (*lookup)(u64){};
         void (*set_base)(u64){};
+        Core::RecompBuildIdFn build_id{};
+        Core::RecompTextHashFn text_sha256{};
+        Core::RecompTextSizeFn text_size{};
+        u64 base{};
     };
     static std::vector<RecompModule> s_recomp_modules;
 
@@ -509,9 +517,17 @@ int main(int argc, char** argv) {
 #ifdef SUYU_CMD_STATIC_RECOMP
     {
         unsigned count = 0;
-        const SuyuRecompStaticModule* mods = suyu_recomp_static_modules(&count);
+        const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v2(&count);
         for (unsigned i = 0; i < count; ++i) {
-            s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base});
+            if (mods == nullptr || mods[i].lookup == nullptr || mods[i].set_base == nullptr ||
+                mods[i].build_id == nullptr || mods[i].text_sha256 == nullptr ||
+                mods[i].text_size == nullptr) {
+                LOG_ERROR(Frontend, "Ignoring invalid static recompiled module registration [{}]",
+                          i);
+                break;
+            }
+            s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].build_id,
+                                        mods[i].text_sha256, mods[i].text_size, 0});
             LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
                      mods[i].name ? mods[i].name : "?");
         }
@@ -551,29 +567,83 @@ int main(int argc, char** argv) {
             using SetBaseFn = void (*)(u64);
             auto lkp = reinterpret_cast<LookupFn>(GetProcAddress(h, "recomp_image_lookup"));
             auto sbf = reinterpret_cast<SetBaseFn>(GetProcAddress(h, "recomp_image_set_base"));
-            if (lkp) {
-                s_recomp_modules.push_back({lkp, sbf});
+            auto bid = reinterpret_cast<Core::RecompBuildIdFn>(
+                GetProcAddress(h, "recomp_image_build_id"));
+            auto tsh = reinterpret_cast<Core::RecompTextHashFn>(
+                GetProcAddress(h, "recomp_image_text_sha256"));
+            auto tsz = reinterpret_cast<Core::RecompTextSizeFn>(
+                GetProcAddress(h, "recomp_image_text_size"));
+            if (lkp && sbf && bid && tsh && tsz) {
+                s_recomp_modules.push_back({lkp, sbf, bid, tsh, tsz, 0});
                 LOG_INFO(Frontend, "Native recompiled module [{}] loaded from {} — ArmRecomp active",
                          s_recomp_modules.size() - 1, Common::UTF16ToUTF8(dll_name));
+            } else {
+                LOG_WARNING(Frontend, "Ignoring incomplete recompiled image {}",
+                            Common::UTF16ToUTF8(dll_name));
+                FreeLibrary(h);
             }
         }
     }
 #endif
 
     if (!s_recomp_modules.empty()) {
-        // Combined lookup: try each module's lookup until one returns non-null.
+        // Dispatch only through an image whose build ID was matched and whose
+        // runtime base has therefore been established.
         Core::SetRecompLookup([](u64 pc) -> Core::RecompBlockFn {
+            const RecompModule* owner = nullptr;
             for (const auto& m : s_recomp_modules) {
-                if (auto fn = m.lookup(pc)) return fn;
+                if (m.base != 0 && m.base <= pc && (!owner || m.base > owner->base)) {
+                    owner = &m;
+                }
             }
-            return nullptr;
+            return owner != nullptr ? owner->lookup(pc) : nullptr;
         });
-        // Route base to the module at the same index in load order.
-        // rtld=index0, main=index1, subsdk0=index2, ..., sdk=last.
-        Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {
-            if (index < s_recomp_modules.size() && s_recomp_modules[index].set_base) {
-                s_recomp_modules[index].set_base(base);
+        Core::SetRecompBinder([](size_t index, const char* module, u64 base, const u8* build_id,
+                                 size_t build_id_size, const u8* text_sha256,
+                                 size_t text_sha256_size, u64 text_size) -> bool {
+            const char* module_name = module != nullptr ? module : "?";
+            if (build_id == nullptr || build_id_size != Core::RecompBuildIdSize ||
+                text_sha256 == nullptr || text_sha256_size != Core::RecompSha256Size) {
+                LOG_ERROR(Frontend, "Invalid identity while binding recompiled module '{}' (#{})",
+                          module_name, index);
+                return false;
             }
+
+            RecompModule* matched = nullptr;
+            for (auto& candidate : s_recomp_modules) {
+                const u8* candidate_build_id =
+                    candidate.build_id != nullptr ? candidate.build_id() : nullptr;
+                const u8* candidate_text_sha256 =
+                    candidate.text_sha256 != nullptr ? candidate.text_sha256() : nullptr;
+                if (candidate_build_id == nullptr || candidate_text_sha256 == nullptr ||
+                    candidate.text_size == nullptr || candidate.text_size() != text_size ||
+                    !std::equal(build_id, build_id + Core::RecompBuildIdSize,
+                                candidate_build_id) ||
+                    !std::equal(text_sha256, text_sha256 + Core::RecompSha256Size,
+                                candidate_text_sha256)) {
+                    continue;
+                }
+                if (matched != nullptr) {
+                    LOG_ERROR(Frontend,
+                              "Multiple recompiled images match module '{}' (#{}) identity",
+                              module_name, index);
+                    return false;
+                }
+                matched = &candidate;
+            }
+            if (matched == nullptr || matched->set_base == nullptr) {
+                LOG_WARNING(
+                    Frontend,
+                    "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x})",
+                    module_name, index, text_size, base);
+                return false;
+            }
+
+            matched->base = base;
+            matched->set_base(base);
+            LOG_INFO(Frontend, "Build-ID matched recompiled module '{}' (#{}) at {:#x}",
+                     module_name, index, base);
+            return true;
         });
         // A window running native recompiled code is a standalone game export,
         // not the suyu dev frontend — the window chrome (title/icon) should

@@ -1150,6 +1150,16 @@ int EmitNso(const Options& options) {
         return 1;
     }
     const u64 entry = base + entry_offset;
+    constexpr std::size_t TextPageSize = 0x1000;
+    const std::size_t mapped_text_size =
+        (text.size() + TextPageSize - 1) & ~(TextPageSize - 1);
+    std::vector<u8> mapped_text{text};
+    mapped_text.resize(mapped_text_size, 0);
+    std::array<u8, 0x20> text_sha256{};
+    if (!suyu::recomp::tool::ComputeSha256(mapped_text, text_sha256)) {
+        std::cerr << "error: could not hash the page-aligned NSO text image\n";
+        return 1;
+    }
     if (!ValidateOutputDirectory(options)) {
         return 1;
     }
@@ -1160,7 +1170,8 @@ int EmitNso(const Options& options) {
             rodata.empty() ? nullptr : rodata.data(), rodata.size(),
             data.empty() ? nullptr : data.data(), data.size(), entry, options.title, nullptr,
             suyu::recomp::RecompileImageLayout{info.segments[1].memory_offset,
-                                               info.segments[2].memory_offset, info.bss_size});
+                                               info.segments[2].memory_offset, info.bss_size},
+            &info.build_id, &text_sha256, static_cast<u64>(mapped_text_size));
         if (!ValidateGeneratedProject(options, !rodata.empty(), !data.empty())) {
             return 1;
         }

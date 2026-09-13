@@ -34,6 +34,11 @@ struct RecompGuestRegs {
 
 using RecompBlockFn = void (*)(void*);
 using RecompLookupFn = RecompBlockFn (*)(u64 pc);
+constexpr std::size_t RecompBuildIdSize = 0x20;
+constexpr std::size_t RecompSha256Size = 0x20;
+using RecompBuildIdFn = const u8* (*)();
+using RecompTextHashFn = const u8* (*)();
+using RecompTextSizeFn = u64 (*)();
 
 /**
  * Registers the lookup function of a loaded recompiled image.
@@ -46,19 +51,20 @@ using RecompLookupFn = RecompBlockFn (*)(u64 pc);
  */
 void SetRecompLookup(RecompLookupFn lookup);
 
-/// Called once per loaded module when a process starts, so each recompiled
-/// image can be told where its module actually landed. Addresses baked in by
-/// the static pass are module-relative - the loader picks the real base at run
-/// time - so without this every pointer the guest computes is short by that
-/// base and lands near null.
-/// `index` is the module's position in load order, lowest base first. Names
-/// cannot be relied on to identify a module: a game's main NSO is named after
-/// the game ("cross2_Release.nss"), and its sdk and subsdk modules carry names
-/// like "nnSdk" and "multimedia", none of which match the file names the
-/// exporter used. Load order is the same on every title - rtld, main, the
-/// subsdks, then sdk - so the index is what actually lines up.
-using RecompBaseFn = void (*)(size_t index, const char* module, u64 base);
-void SetRecompBaseSetter(RecompBaseFn setter);
+/// Identifies the loaded NSO by its immutable 32-byte build ID, then tells the
+/// matching recompiled image where the module landed. The callback must return
+/// true only after finding exactly one byte-for-byte build-ID, mapped-text-size,
+/// and live-text SHA-256 match and setting that image's base. Initialization
+/// fails closed before guest memory is modified when no matching image exists.
+///
+/// `index` and `module` are diagnostic hints only. They are not identities:
+/// filenames and embedded module names routinely differ, while load order is
+/// not sufficient to distinguish two unrelated single-module titles.
+using RecompBindFn = bool (*)(std::size_t index, const char* module, u64 base,
+                              const u8* build_id, std::size_t build_id_size,
+                              const u8* text_sha256, std::size_t text_sha256_size,
+                              u64 text_size);
+void SetRecompBinder(RecompBindFn binder);
 
 /// Returns the registered lookup, or nullptr when no recompiled image is
 /// loaded and the JIT should be used.

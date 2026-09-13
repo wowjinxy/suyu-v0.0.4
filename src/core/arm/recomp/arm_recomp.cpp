@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,8 @@
 #include <optional>
 #include <string>
 #include <utility>
+
+#include <openssl/evp.h>
 
 #include "common/logging/log.h"
 #include "core/arm/debug.h"
@@ -94,15 +97,15 @@ constexpr int kHaltUnhandled = 2;
 
 namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
-std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
+std::atomic<RecompBindFn> g_recomp_binder{nullptr};
 } // namespace
 
 void SetRecompLookup(RecompLookupFn lookup) {
     g_recomp_lookup.store(lookup, std::memory_order_release);
 }
 
-void SetRecompBaseSetter(RecompBaseFn setter) {
-    g_recomp_base_setter.store(setter, std::memory_order_release);
+void SetRecompBinder(RecompBindFn binder) {
+    g_recomp_binder.store(binder, std::memory_order_release);
 }
 
 RecompLookupFn GetRecompLookup() {
@@ -217,6 +220,31 @@ struct ArmRecomp::Impl {
         return memory.WriteBlock(Kernel::KProcessAddress{address}, source.data(), source.size());
     }
 
+    static bool HashMappedText(Core::Memory::Memory& memory, u64 base, u64 size,
+                               std::array<u8, RecompSha256Size>& digest) {
+        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context{EVP_MD_CTX_new(),
+                                                                       EVP_MD_CTX_free};
+        if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+            return false;
+        }
+
+        std::array<u8, 64 * 1024> buffer{};
+        u64 offset = 0;
+        while (offset < size) {
+            const std::size_t chunk =
+                static_cast<std::size_t>((std::min)(size - offset, u64{buffer.size()}));
+            if (!memory.ReadBlock(Kernel::KProcessAddress{base + offset}, buffer.data(), chunk) ||
+                EVP_DigestUpdate(context.get(), buffer.data(), chunk) != 1) {
+                return false;
+            }
+            offset += chunk;
+        }
+
+        unsigned int digest_size = 0;
+        return EVP_DigestFinal_ex(context.get(), digest.data(), &digest_size) == 1 &&
+               digest_size == digest.size();
+    }
+
     void FailInitialization(Initialization state, std::string error) {
         process_state->initialization = state;
         process_state->error = std::move(error);
@@ -322,9 +350,9 @@ struct ArmRecomp::Impl {
         }
 
         const auto& [module_base, module_name] = *modules.begin();
-        const std::optional<u64> image_size =
-            GetNsoModuleImageSize(process, Kernel::KProcessAddress{module_base});
-        if (!image_size) {
+        const auto image_layout =
+            GetNsoModuleImageLayout(process, Kernel::KProcessAddress{module_base});
+        if (!image_layout) {
             FailInitialization(Initialization::FallbackOnly,
                                "loaded NSO memory layout failed structural validation");
             return;
@@ -333,10 +361,10 @@ struct ArmRecomp::Impl {
         LiveModuleMemory live_memory{
             .memory = &process->GetMemory(),
             .base = module_base,
-            .image_size = *image_size,
+            .image_size = image_layout->image_size,
         };
         const suyu::recomp::NsoModuleView module{
-            .image_size = *image_size,
+            .image_size = image_layout->image_size,
             .text_address = 0,
             .user = &live_memory,
             .read = ReadModuleMemory,
@@ -360,8 +388,8 @@ struct ArmRecomp::Impl {
                                "NSO dynamic symbols were rejected: " + symbols.error);
             return;
         }
-        const auto relocation_plan = suyu::recomp::PlanNsoRelocations(*image_size, *dynamic.info,
-                                                                      *symbols.info, module_base);
+        const auto relocation_plan = suyu::recomp::PlanNsoRelocations(
+            image_layout->image_size, *dynamic.info, *symbols.info, module_base);
         if (!relocation_plan) {
             FailInitialization(Initialization::FallbackOnly,
                                "NSO relocations were rejected: " + relocation_plan.error);
@@ -376,7 +404,28 @@ struct ArmRecomp::Impl {
             return;
         }
 
+        const auto binder = g_recomp_binder.load(std::memory_order_acquire);
+        if (binder == nullptr) {
+            FailInitialization(Initialization::FallbackOnly,
+                               "recompiled image has no identity-and-base binding callback");
+            return;
+        }
         auto& memory = process->GetMemory();
+        std::array<u8, RecompSha256Size> text_sha256{};
+        if (!HashMappedText(memory, module_base, image_layout->text_size, text_sha256)) {
+            FailInitialization(Initialization::FallbackOnly,
+                               "could not hash the live mapped NSO text image");
+            return;
+        }
+        const auto& build_id = system.GetApplicationProcessBuildID();
+        if (!binder(0, module_name.c_str(), module_base, build_id.data(), build_id.size(),
+                    text_sha256.data(), text_sha256.size(), image_layout->text_size)) {
+            FailInitialization(
+                Initialization::FallbackOnly,
+                "no unique recompiled image matched the loaded NSO identity and live text");
+            return;
+        }
+
         const suyu::recomp::NsoRelocationMemory transaction_memory{
             .user = &memory,
             .read = ReadTransactionMemory,
@@ -395,20 +444,12 @@ struct ArmRecomp::Impl {
         process_state->relocations_committed = true;
         process_state->relocation_writes = committed.relocation_writes;
         process_state->finalization_writes = committed.finalization_writes;
-
-        const auto setter = g_recomp_base_setter.load(std::memory_order_acquire);
-        if (setter == nullptr) {
-            FailInitialization(Initialization::FallbackOnly,
-                               "recompiled image has no module-base registration callback");
-            return;
-        }
-        setter(0, module_name.c_str(), module_base);
         process_state->initialization = Initialization::Ready;
         LOG_INFO(Core_ARM,
                  "recomp: committed {} relocations and {} finalizers for '{}' at {:#x} "
                  "(image size {:#x})",
                  committed.relocation_writes, committed.finalization_writes, module_name,
-                 module_base, *image_size);
+                 module_base, image_layout->image_size);
     }
 
     /// Discover modules, validate and commit relocations, then publish the

@@ -6203,6 +6203,9 @@ namespace {
         std::string name;
         Core::RecompLookupFn lookup;
         void (*set_base)(u64);
+        Core::RecompBuildIdFn build_id;
+        Core::RecompTextHashFn text_sha256;
+        Core::RecompTextSizeFn text_size;
         u64 base = 0;
     };
 std::vector<QLibrary*> loaded_images;
@@ -6211,6 +6214,7 @@ std::vector<RecompImage> loaded_records;
 
 void GMainWindow::UnloadRecompiledImages() {
     Core::SetRecompLookup(nullptr);
+    Core::SetRecompBinder(nullptr);
     for (auto* lib : loaded_images) {
         lib->unload();
         lib->deleteLater();
@@ -6291,9 +6295,17 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
             lib->deleteLater();
             continue;
         }
-        const auto fn =
+        const auto lookup =
             reinterpret_cast<Core::RecompLookupFn>(lib->resolve("recomp_image_lookup"));
-        if (!fn) {
+        const auto set_base =
+            reinterpret_cast<void (*)(u64)>(lib->resolve("recomp_image_set_base"));
+        const auto build_id =
+            reinterpret_cast<Core::RecompBuildIdFn>(lib->resolve("recomp_image_build_id"));
+        const auto text_sha256 = reinterpret_cast<Core::RecompTextHashFn>(
+            lib->resolve("recomp_image_text_sha256"));
+        const auto text_size =
+            reinterpret_cast<Core::RecompTextSizeFn>(lib->resolve("recomp_image_text_size"));
+        if (!lookup || !set_base || !build_id || !text_sha256 || !text_size) {
             // Some other library that happens to sit in the tree.
             lib->unload();
             lib->deleteLater();
@@ -6311,15 +6323,16 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
                 break;
             }
         }
-        auto* set_base =
-            reinterpret_cast<void (*)(u64)>(lib->resolve("recomp_image_set_base"));
-        records.push_back(RecompImage{owner.dirName().toStdString(), fn, set_base, 0});
+        records.push_back(RecompImage{owner.dirName().toStdString(), lookup, set_base, build_id,
+                                      text_sha256, text_size, 0});
     }
 
     if (found.empty()) {
         return 0;
     }
 
+    Core::SetRecompLookup(nullptr);
+    Core::SetRecompBinder(nullptr);
     for (auto* lib : loaded_images) {
         lib->unload();
         lib->deleteLater();
@@ -6327,53 +6340,48 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     loaded_images = std::move(found);
     loaded_records = std::move(records);
 
-    // Kernel module names carry an "nn" prefix that the export directories do
-    // not ("nnrtld" against "rtld"), so try both spellings.
-    Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
-        // Try the name first - it works for rtld - then fall back to load
-        // order. A game's own modules are not named after the files they were
-        // exported from: main is named after the game ("cross2_Release.nss"),
-        // and the others come through as "nnSdk" and "multimedia". Load order
-        // is identical across titles, so position is the dependable key.
-        static const char* kByLoadOrder[] = {"rtld", "main", "subsdk0", "sdk"};
+    Core::SetRecompBinder([](size_t index, const char* module, u64 base, const u8* build_id,
+                             size_t build_id_size, const u8* text_sha256,
+                             size_t text_sha256_size, u64 text_size) -> bool {
+        const char* module_name = module != nullptr ? module : "?";
+        if (build_id == nullptr || build_id_size != Core::RecompBuildIdSize ||
+            text_sha256 == nullptr || text_sha256_size != Core::RecompSha256Size) {
+            LOG_ERROR(Frontend, "Invalid identity while binding recompiled module '{}' (#{})",
+                      module_name, index);
+            return false;
+        }
 
-        std::string name = module;
-        auto ci_equal = [](const std::string& a, const std::string& b) {
-            return a.size() == b.size() &&
-                   std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
-                       return std::tolower(static_cast<unsigned char>(x)) ==
-                              std::tolower(static_cast<unsigned char>(y));
-                   });
-        };
-        auto match = [&](const std::string& candidate) -> RecompImage* {
-            for (auto& record : loaded_records) {
-                // Kernel module names ("nnSdk") and export directory names
-                // ("sdk") differ in case as well as the "nn" prefix already
-                // stripped above - a case-sensitive compare here silently
-                // fails and falls through to guessing by load order instead
-                // of the name actually matching.
-                if (ci_equal(record.name, candidate)) {
-                    return &record;
-                }
+        RecompImage* matched = nullptr;
+        for (auto& record : loaded_records) {
+            const u8* candidate_build_id = record.build_id();
+            const u8* candidate_text_sha256 = record.text_sha256();
+            if (candidate_build_id == nullptr || candidate_text_sha256 == nullptr ||
+                record.text_size() != text_size ||
+                !std::equal(build_id, build_id + Core::RecompBuildIdSize, candidate_build_id) ||
+                !std::equal(text_sha256, text_sha256 + Core::RecompSha256Size,
+                            candidate_text_sha256)) {
+                continue;
             }
-            return nullptr;
-        };
-        RecompImage* record = match(name);
-        if (!record && name.rfind("nn", 0) == 0) {
-            record = match(name.substr(2));
+            if (matched != nullptr) {
+                LOG_ERROR(Frontend,
+                          "Multiple recompiled images match module '{}' (#{}) identity",
+                          module_name, index);
+                return false;
+            }
+            matched = &record;
         }
-        if (!record && index < std::size(kByLoadOrder)) {
-            record = match(kByLoadOrder[index]);
+        if (matched == nullptr) {
+            LOG_WARNING(Frontend,
+                        "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x})",
+                        module_name, index, text_size, base);
+            return false;
         }
-        if (record && record->set_base) {
-            record->base = base;
-            record->set_base(base);
-            LOG_INFO(Frontend, "Recompiled image for module '{}' (#{}) based at {:#x}", name,
-                     index, base);
-        } else {
-            LOG_WARNING(Frontend, "No recompiled image for module '{}' (#{}, base {:#x})", name,
-                        index, base);
-        }
+
+        matched->base = base;
+        matched->set_base(base);
+        LOG_INFO(Frontend, "Build-ID matched recompiled image '{}' for module '{}' (#{}) at {:#x}",
+                 matched->name, module_name, index, base);
+        return true;
     });
 
     // Every exported image lookup accepts an absolute PC and subtracts the

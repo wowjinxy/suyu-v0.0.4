@@ -45,6 +45,12 @@ if (SUYU_CMD OR YUZU_CMD)
     # This is an *additional* target - plain suyu-cmd stays game-agnostic.
     # ---------------------------------------------------------------------
     if (SUYU_CMD_RECOMP_DIR AND EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_registration.c")
+        file(READ "${SUYU_CMD_RECOMP_DIR}/recomp_registration.c" _recomp_registration)
+        if (NOT _recomp_registration MATCHES "suyu_recomp_static_modules_v2")
+            message(FATAL_ERROR
+                "The recompiled-module registration in ${SUYU_CMD_RECOMP_DIR} uses an older "
+                "ABI without full image identity metadata. Re-export the title before building.")
+        endif()
         enable_language(C)
         # Tells the generated module projects to emit only the static library,
         # skipping their portable standalone exe (whose target name would
