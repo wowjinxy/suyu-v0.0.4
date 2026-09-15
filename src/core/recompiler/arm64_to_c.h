@@ -2123,7 +2123,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         }
         ++block_index;
         FuncNameTo(namebuf, mod.c_str(), b.vaddr);
-        rcu += "void ";
+        rcu += "static void ";
         rcu += namebuf;
         rcu += "(GuestContext* c){\n";
         const u32 first = (u32)((b.vaddr - base) / 4);
@@ -2457,7 +2457,13 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "#define RECOMP_API __declspec(dllexport)\n"
           "#else\n"
           "#define RECOMP_API __attribute__((visibility(\"default\")))\n"
-          "#endif\n\n";
+          "#endif\n\n"
+          "RECOMP_API const uint8_t* recomp_image_build_id(void);\n"
+          "RECOMP_API const uint8_t* recomp_image_text_sha256(void);\n"
+          "RECOMP_API uint64_t recomp_image_text_size(void);\n"
+          "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc);\n"
+          "RECOMP_API void recomp_image_set_base(uint64_t base);\n"
+          "RECOMP_API uint64_t recomp_image_entry(void);\n\n";
 
     const std::array<u8, 0x20> empty_build_id{};
     const auto& emitted_build_id = build_id ? *build_id : empty_build_id;
@@ -2813,8 +2819,9 @@ int recomp_cond(GuestContext* c,unsigned cond){
 /* ── Save-data filesystem ── */
 
 static void mkpath(const char* path) {
-  char tmp[512]; size_t len;
-  snprintf(tmp,sizeof tmp,"%s",path); len=strlen(tmp);
+  char tmp[1024]; size_t len=strlen(path);
+  if(len>=sizeof tmp) return;
+  memcpy(tmp,path,len+1);
   for(size_t i=1;i<len;i++){
     if(tmp[i]==PATH_SEP||tmp[i]=='/'){tmp[i]=0; MKDIR(tmp); tmp[i]=PATH_SEP;}
   }
@@ -2853,11 +2860,14 @@ int recomp_save_read(GuestContext* c, const char* name, void* buf, uint64_t buf_
   snprintf(path,sizeof path,"%s%c%s",c->save_dir,PATH_SEP,name);
   FILE* f=fopen(path,"rb");
   if(!f){if(out_size)*out_size=0; return 0;}
-  fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+  if(fseek(f,0,SEEK_END)!=0){fclose(f); if(out_size)*out_size=0; return 0;}
+  long sz=ftell(f);
+  if(sz<0||fseek(f,0,SEEK_SET)!=0){fclose(f); if(out_size)*out_size=0; return 0;}
   uint64_t to_read=(uint64_t)sz<buf_size?(uint64_t)sz:buf_size;
-  fread(buf,1,(size_t)to_read,f); fclose(f);
-  if(out_size)*out_size=to_read;
-  printf("[recomp] Loaded %llu bytes <- %s\n",(unsigned long long)to_read,path);
+  size_t got=fread(buf,1,(size_t)to_read,f); int failed=ferror(f); fclose(f);
+  if(out_size)*out_size=(uint64_t)got;
+  if(failed||got!=(size_t)to_read) return 0;
+  printf("[recomp] Loaded %llu bytes <- %s\n",(unsigned long long)got,path);
   return 1;
 }
 

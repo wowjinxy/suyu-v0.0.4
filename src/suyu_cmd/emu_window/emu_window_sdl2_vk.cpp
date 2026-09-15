@@ -30,9 +30,17 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     // generic "suyu ..." title that would otherwise flash for a moment
     // before the game's own title gets set later in the boot sequence.
     const std::string window_title = [] {
+#ifdef _WIN32
         wchar_t exe_w[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
         return std::filesystem::path(exe_w).stem().string();
+#elif defined(__linux__)
+        std::error_code ec;
+        const auto executable_path = std::filesystem::canonical("/proc/self/exe", ec);
+        return ec ? std::string{"suyu-recompiled"} : executable_path.stem().string();
+#else
+        return std::string{"suyu-recompiled"};
+#endif
     }();
 #else
     const std::string window_title = fmt::format("suyu {} | {}-{} (Vulkan)", Common::g_build_name,

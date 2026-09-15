@@ -260,6 +260,8 @@ function New-RegistrationSource {
     [void]$builder.AppendLine("    uint64_t (*text_size)(void);")
     [void]$builder.AppendLine("} SuyuRecompStaticModule;")
     [void]$builder.AppendLine("")
+    [void]$builder.AppendLine("const SuyuRecompStaticModule* suyu_recomp_static_modules_v2(unsigned* count);")
+    [void]$builder.AppendLine("")
     [void]$builder.AppendLine("static const SuyuRecompStaticModule s_modules[] = {")
     foreach ($module in $Modules) {
         [void]$builder.AppendLine("    {`"${module}`", recomp_image_lookup_${module}, recomp_image_set_base_${module},")

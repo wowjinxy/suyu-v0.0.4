@@ -1828,6 +1828,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                  "    const uint8_t* (*text_sha256)(void);\n"
                  "    uint64_t (*text_size)(void);\n"
                  "} SuyuRecompStaticModule;\n\n"
+                 "const SuyuRecompStaticModule* suyu_recomp_static_modules_v2(unsigned* count);\n\n"
                  "static const SuyuRecompStaticModule s_modules[] = {\n";
             for (const auto& m : ordered) {
                 o << "    { \"" << m << "\", recomp_image_lookup_" << m

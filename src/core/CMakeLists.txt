@@ -1235,6 +1235,7 @@ else()
 endif()
 
 target_link_libraries(core PRIVATE
+    Boost::regex
     OpenSSL::SSL
     fmt::fmt
     nlohmann_json::nlohmann_json

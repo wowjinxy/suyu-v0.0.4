@@ -129,7 +129,7 @@ NpdmInspection InspectNpdm(std::span<const std::uint8_t> file) {
         result.error = "invalid ACID magic";
         return result;
     }
-    for (const auto [offset, name] : {std::pair{std::size_t{0x20}, "ACI0 file-access"},
+    for (const auto& [offset, name] : {std::pair{std::size_t{0x20}, "ACI0 file-access"},
                                       std::pair{std::size_t{0x28}, "ACI0 service-access"},
                                       std::pair{std::size_t{0x30}, "ACI0 kernel-access"}}) {
         if (!ValidateSubregion(file, info.aci_offset, info.aci_size, offset, MinimumAciSize, name,
@@ -137,7 +137,7 @@ NpdmInspection InspectNpdm(std::span<const std::uint8_t> file) {
             return result;
         }
     }
-    for (const auto [offset, name] : {std::pair{std::size_t{0x220}, "ACID file-access"},
+    for (const auto& [offset, name] : {std::pair{std::size_t{0x220}, "ACID file-access"},
                                       std::pair{std::size_t{0x228}, "ACID service-access"},
                                       std::pair{std::size_t{0x230}, "ACID kernel-access"}}) {
         if (!ValidateSubregion(file, info.acid_offset, info.acid_size, offset, MinimumAcidSize,
