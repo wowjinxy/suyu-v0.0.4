@@ -18,8 +18,8 @@ namespace {
 
 class SaveDirectoryFilesystem final : public FileSys::VfsFilesystem {
 public:
-    explicit SaveDirectoryFilesystem(FileSys::VirtualDir root)
-        : VfsFilesystem{std::move(root)} {}
+    explicit SaveDirectoryFilesystem(FileSys::VirtualDir root_directory)
+        : VfsFilesystem{std::move(root_directory)} {}
 
     FileSys::VirtualDir OpenDirectory(std::string_view, FileSys::OpenMode) override {
         return root;

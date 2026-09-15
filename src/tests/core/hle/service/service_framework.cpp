@@ -11,8 +11,8 @@ namespace {
 
 class RegistrationTestService final : public ServiceFramework<RegistrationTestService> {
 public:
-    explicit RegistrationTestService(Core::System& system)
-        : ServiceFramework{system, "registration-test"} {
+    explicit RegistrationTestService(Core::System& system_ref)
+        : ServiceFramework{system_ref, "registration-test"} {
         static const FunctionInfo functions[] = {
             {0, &RegistrationTestService::Handle, "Cmif0"},
             {1, &RegistrationTestService::Handle, "Cmif1"},
