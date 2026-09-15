@@ -96,6 +96,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QProgressBar>
 #include <QProgressDialog>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QSplashScreen>
 #include <QShortcut>
@@ -715,25 +716,6 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
     if (!has_gamepath && is_qlaunch) {
         OnHomeMenu();
     }
-    // The CPU backend is chosen when the process starts, so the recompiled
-    // images have to be in place *before* BootGame - loading them afterwards
-    // (as the deferred SUYU_RECOMP_DIR hook below did for a command-line game)
-    // silently boots the game on the JIT instead. SUYU_RECOMP_DIR wins when
-    // set; otherwise a game inside an export package brings its own images.
-    if (!game_path.isEmpty()) {
-        QString recomp_dir = QString::fromLocal8Bit(qgetenv("SUYU_RECOMP_DIR"));
-        if (recomp_dir.isEmpty()) {
-            recomp_dir = FindRecompiledImageDirFor(game_path);
-        }
-        if (!recomp_dir.isEmpty()) {
-            const int loaded = LoadRecompiledImagesFrom(recomp_dir);
-            if (loaded == 0) {
-                LOG_WARNING(Frontend, "No recompiled images under {}, booting on the JIT",
-                            recomp_dir.toStdString());
-            }
-        }
-    }
-
     if (single_game_mode_) {
         EnterSingleGameMode();
     }
@@ -2217,6 +2199,49 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
     ConfigureFilesystemProvider(filename.toStdString());
     const auto v_file = Core::GetGameFileFromPath(vfs, filename.toUtf8().constData());
     const auto loader = Loader::GetLoader(*system, v_file, params.program_id, params.program_index);
+
+    // The CPU backend is selected while LoadROM creates the application
+    // process, so choose the title's verified AOT image before that call. This
+    // lives in the common boot path rather than the constructor so launches
+    // from the library, recent-files menu, drag-and-drop, and the command line
+    // all follow the same static-first policy.
+    const bool keep_manual_selection =
+        std::exchange(preserve_recompiled_images_for_next_boot_, false) &&
+        RecompiledImagesLoaded();
+    if (!keep_manual_selection) {
+        QString game_name;
+        if (loader != nullptr) {
+            std::string loader_title;
+            if (loader->ReadTitle(loader_title) == Loader::ResultStatus::Success) {
+                game_name = QString::fromStdString(loader_title).trimmed();
+            }
+        }
+
+        QString recomp_dir = QString::fromLocal8Bit(qgetenv("SUYU_RECOMP_DIR"));
+        if (recomp_dir.isEmpty()) {
+            recomp_dir = FindRecompiledImageDirFor(filename, game_name);
+        }
+
+        // Images are process-specific. Leaving the previous game's dispatcher
+        // installed would make the next title enter ArmRecomp only to fail its
+        // identity check and spend the whole run behind an unnecessary wrapper.
+        if (RecompiledImagesLoaded()) {
+            UnloadRecompiledImages();
+        }
+        if (!recomp_dir.isEmpty()) {
+            const int loaded = LoadRecompiledImagesFrom(recomp_dir);
+            if (loaded == 0) {
+                LOG_WARNING(Frontend, "No compatible recompiled images under {}; booting on JIT",
+                            recomp_dir.toStdString());
+            } else {
+                LOG_INFO(Frontend, "Static-first launch selected {} AOT image(s) for '{}'", loaded,
+                         filename.toStdString());
+            }
+        }
+    } else {
+        LOG_INFO(Frontend, "Using manually selected recompiled images for '{}'",
+                 filename.toStdString());
+    }
 
     if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
         type == StartGameType::Normal) {
@@ -6237,15 +6262,61 @@ bool GMainWindow::RecompiledImagesLoaded() const {
     return !loaded_images.empty();
 }
 
-QString GMainWindow::FindRecompiledImageDirFor(const QString& game_path) {
-    // Every export package layout - Windows package dir, Linux AppDir usr/bin,
-    // macOS Contents/Resources - puts aot_cache beside the bundled ROM, so the
-    // ROM's own directory is the only place worth looking.
-    const QString base = QFileInfo(game_path).absolutePath();
-    const QStringList candidates = {
-        base + QStringLiteral("/aot_cache/recompiled"),
-        base + QStringLiteral("/recompiled"),
+QString GMainWindow::FindRecompiledImageDirFor(const QString& game_path,
+                                               const QString& game_name) {
+    QStringList candidates;
+    const auto add_cache_layouts = [&candidates](const QString& cache_root) {
+        if (cache_root.isEmpty()) {
+            return;
+        }
+        // `exefs` is the current exporter layout. `recompiled` is retained for
+        // caches produced before that layout change and for hand-built trees.
+        candidates.append(cache_root + QStringLiteral("/exefs"));
+        candidates.append(cache_root + QStringLiteral("/recompiled"));
     };
+
+    const QFileInfo game_info(game_path);
+    const QString game_dir = game_info.absolutePath();
+    add_cache_layouts(game_dir + QStringLiteral("/aot_cache"));
+    candidates.append(game_dir + QStringLiteral("/recompiled"));
+
+    // A source-only package boots exefs/main, while its aot_cache is a sibling
+    // of exefs. Account for that package shape as well as a ROM beside a cache.
+    QDir package_dir(game_dir);
+    if (package_dir.dirName().compare(QStringLiteral("exefs"), Qt::CaseInsensitive) == 0 &&
+        package_dir.cdUp()) {
+        add_cache_layouts(package_dir.absoluteFilePath(QStringLiteral("aot_cache")));
+    }
+
+    QStringList names;
+    const auto add_name = [&names](QString name) {
+        name = name.trimmed();
+        if (name.isEmpty()) {
+            return;
+        }
+        static const QRegularExpression illegal(QStringLiteral("[\\\\/:*?\"<>|]"));
+        name.replace(illegal, QStringLiteral("_"));
+        if (!names.contains(name)) {
+            names.append(name);
+        }
+    };
+    add_name(game_name);
+    add_name(game_info.completeBaseName());
+
+    // Exports can live away from the original ROM. Search only the handful of
+    // roots the exporter remembers, and only the two title-derived directory
+    // names, rather than recursively loading every game's native code.
+    for (const QString& root : GameExportDialog::RecompileOutputRoots()) {
+        for (const QString& name : names) {
+            add_cache_layouts(root + QDir::separator() + name +
+                              QStringLiteral("/aot_cache"));
+            add_cache_layouts(root + QDir::separator() + name +
+                              QStringLiteral(".AppDir/usr/bin/aot_cache"));
+            add_cache_layouts(root + QDir::separator() + name +
+                              QStringLiteral(".app/Contents/Resources/aot_cache"));
+        }
+    }
+    candidates.removeDuplicates();
 
 #ifdef _WIN32
     const QString pattern = QStringLiteral("*.dll");
@@ -6533,6 +6604,7 @@ void GMainWindow::OnLoadRecompiledImage() {
         }
         return;
     }
+    preserve_recompiled_images_for_next_boot_ = true;
 
     // No modal when the load was driven by the environment variable - that path
     // is meant to run unattended.

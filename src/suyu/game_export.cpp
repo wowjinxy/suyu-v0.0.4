@@ -2195,7 +2195,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             out << "  \"recompile_known_translated_percent\": null,\n";
             out << "  \"recompile_known_unhandled_percent\": null,\n";
         }
-        out << "  \"recompiled_project\": \"recompiled/<module>/ (buildable C, cross-platform CMake; "
+        out << "  \"recompiled_project\": \"exefs/<module>/ (buildable C, cross-platform CMake; "
                "generated units in <module>/src, build output in <module>/build)\",\n";
         out << "  \"native_build_scripts\": [\"recompiled/build_native_windows.cmd\", \"recompiled/build_native_unix.sh\"],\n";
         out << "  \"requires_runtime_codegen\": false,\n";
@@ -2303,7 +2303,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         QTextStream out(&ref);
         out << "Recompiled from: " << QDir::toNativeSeparators(rom_path) << "\n"
             << "The ROM is referenced, not bundled - the generated project runs from the guest\n"
-            << "segments in aot_cache/recompiled/<module>/data and does not read this file.\n";
+            << "segments in aot_cache/exefs/<module>/data and does not read this file.\n";
         ref.close();
     };
 
@@ -2679,6 +2679,10 @@ QStringList GameExportDialog::FindRecompiledExecutables(const QString& game_name
     // A package can be laid out for any of the three target platforms, and the
     // build directory is single- or multi-config depending on the generator.
     static const QStringList package_suffixes = {
+        QStringLiteral("/aot_cache/exefs"),
+        QStringLiteral(".AppDir/usr/bin/aot_cache/exefs"),
+        QStringLiteral(".app/Contents/Resources/aot_cache/exefs"),
+        // Legacy/hand-built layout retained for existing exports.
         QStringLiteral("/aot_cache/recompiled"),
         QStringLiteral(".AppDir/usr/bin/aot_cache/recompiled"),
         QStringLiteral(".app/Contents/Resources/aot_cache/recompiled"),
@@ -2705,7 +2709,8 @@ QStringList GameExportDialog::FindRecompiledExecutables(const QString& game_name
                 found.prepend(QDir::toNativeSeparators(pkg_launcher));
             }
 
-            // Legacy layout: deep in aot_cache/recompiled/<module>/build/
+            // Per-module layout: deep in aot_cache/exefs/<module>/build/ (or
+            // the legacy aot_cache/recompiled equivalent).
             for (const QString& suffix : package_suffixes) {
                 const QString recomp_root = root + QDir::separator() + name + suffix;
                 QDir dir(recomp_root);
@@ -3048,7 +3053,7 @@ void GameExportDialog::OnExport() {
                "- Runtime with save/load support (save_data/ directory next to exe)\n"
                "- Bundled data segments (text, rodata, data)\n"
                "- Build scripts for Windows (.cmd) and Unix (.sh)\n\n"
-               "Run build_native_windows.cmd (or build_native_unix.sh) in aot_cache/recompiled/ to compile.\n"
+               "Run build_native_windows.cmd (or build_native_unix.sh) in aot_cache/exefs/ to compile.\n"
                "The resulting executable runs independently — no emulator required.\n\n"
                "(Choose \"Build\" instead of \"Source\" as the Export Format to have suyu compile "
                "this for you automatically.)")
