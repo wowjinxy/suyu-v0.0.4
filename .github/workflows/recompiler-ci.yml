@@ -1,0 +1,66 @@
+name: Static recompiler CI
+
+on:
+  push:
+    branches:
+      - static-recompiler
+    paths:
+      - ".github/workflows/recompiler-ci.yml"
+      - "CMakeLists.txt"
+      - "src/core/recompiler/**"
+      - "tools/static_recompiler/**"
+      - ".gitmodules"
+  pull_request:
+    paths:
+      - ".github/workflows/recompiler-ci.yml"
+      - "CMakeLists.txt"
+      - "src/core/recompiler/**"
+      - "tools/static_recompiler/**"
+      - ".gitmodules"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recompiler-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone:
+    name: Standalone (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2022
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize required dependency
+        shell: bash
+        run: git submodule update --init --depth=1 externals/mbedtls
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: >-
+          cmake -S tools/static_recompiler -B build/recompiler
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build/recompiler --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build/recompiler --output-on-failure

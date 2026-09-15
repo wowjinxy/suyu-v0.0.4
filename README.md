@@ -20,9 +20,10 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 
 ---
 
-> **This is the final public release of suyu — v0.04. This repository is a public archive.**
->
-> No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
+> **This fork is under active development.** Its default branch is focused on a
+> title-specialized, static-first runtime with a correctness-preserving Dynarmic
+> fallback. See the [static recompiler roadmap](docs/StaticRecompiler.md) for
+> what works today and what still needs to be proven.
 
 ## About
 
@@ -35,7 +36,8 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Final version: **v0.04**. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android).
+The current base is **v0.04**, with continued development on top. Release builds are published to
+the [releases page](../../releases) by GitHub Actions when maintainers cut one.
 
 Platforms: Windows, Linux, Android. macOS/iOS not included in this release.
 
