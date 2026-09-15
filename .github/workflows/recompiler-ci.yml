@@ -4,37 +4,7 @@ on:
   push:
     branches:
       - static-recompiler
-    paths:
-      - ".github/workflows/recompiler-ci.yml"
-      - "CMakeLists.txt"
-      - "src/core/arm/arm_interface.h"
-      - "src/core/arm/dynarmic/**"
-      - "src/core/arm/recomp/**"
-      - "src/core/hle/kernel/k_process.cpp"
-      - "src/core/hle/kernel/k_process.h"
-      - "src/core/recompiler/**"
-      - "src/suyu/game_export.cpp"
-      - "src/suyu/game_export.h"
-      - "src/suyu/main.cpp"
-      - "src/suyu_cmd/**"
-      - "tools/static_recompiler/**"
-      - ".gitmodules"
   pull_request:
-    paths:
-      - ".github/workflows/recompiler-ci.yml"
-      - "CMakeLists.txt"
-      - "src/core/arm/arm_interface.h"
-      - "src/core/arm/dynarmic/**"
-      - "src/core/arm/recomp/**"
-      - "src/core/hle/kernel/k_process.cpp"
-      - "src/core/hle/kernel/k_process.h"
-      - "src/core/recompiler/**"
-      - "src/suyu/game_export.cpp"
-      - "src/suyu/game_export.h"
-      - "src/suyu/main.cpp"
-      - "src/suyu_cmd/**"
-      - "tools/static_recompiler/**"
-      - ".gitmodules"
   workflow_dispatch:
 
 permissions:
@@ -56,7 +26,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Initialize required dependency
         shell: bash
@@ -89,7 +59,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Initialize submodules
         run: >-
