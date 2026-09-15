@@ -25,6 +25,8 @@ rasterizer, and runtime shader translation.
 - `core/recompiler/arm64_to_c.h` discovers AArch64 blocks and emits portable C.
 - `core/arm/recomp/arm_recomp.cpp` implements the normal CPU interface and bridges generated code
   to suyu memory, SVC dispatch, and a lazy Dynarmic fallback.
+- Live instruction-cache invalidation now fails safe: once executable code changes, every core in
+  that process stays on Dynarmic instead of dispatching stale immutable AOT blocks.
 - `core/recompiler/nso_image.{h,cpp}` now provides checked, non-Qt NSO0 inspection and segment
   decoding to both the command-line tool and in-app exporter.
 - `core/recompiler/npdm_info.{h,cpp}` provides a dependency-light, structurally checked NPDM
@@ -99,12 +101,15 @@ rasterizer, and runtime shader translation.
 
 ## Immediate correctness work
 
-1. Preserve FPCR/FPSR in `ArmRecomp::GetContext` and `SetContext`.
-2. Add hosted AOT-vs-Dynarmic differential tests before expanding instruction coverage.
-3. Replace heuristic runtime module discovery with loader-provided module descriptors.
-4. Add coverage/fallback counters and first-failure diagnostics.
-5. Fix or deliberately delegate exclusives/LSE atomics, indirect targets, TLS/relocations, and
-   instruction-cache invalidation.
+1. Add hosted AOT-vs-Dynarmic differential tests before expanding instruction coverage.
+2. Add coverage/fallback counters and first-failure diagnostics.
+3. Fix or deliberately delegate exclusives/LSE atomics and remaining indirect-target,
+   TLS/relocation, and dynamically loaded-code cases.
+
+Completed correctness gates include loader-provided module discovery, full
+GPR/vector/NZCV/FPCR/FPSR/TLS state transfer across AOT/JIT handoffs, and conservative
+instruction-cache invalidation: generated code is immutable, so the first live invalidation
+permanently delegates that process to Dynarmic.
 
 ## Development and distribution boundary
 

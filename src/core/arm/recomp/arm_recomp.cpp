@@ -126,6 +126,14 @@ public:
     std::once_flag announce_once;
     Loader::AppLoader::Modules modules;
     Initialization initialization{Initialization::Uninitialized};
+    // Published only after the generated images have been identity-checked and
+    // (for a single NSO) their relocations committed. Loader-time cache flushes
+    // before this point describe the original image and must not disable AOT.
+    std::atomic<bool> static_image_published{false};
+    // Generated native code is immutable. Once the guest changes executable
+    // code, there is no safe per-block repair yet, so every core must remain on
+    // Dynarmic for the rest of this process.
+    std::atomic<bool> force_jit{false};
     std::string error;
     bool relocations_committed{};
     u64 relocation_writes{};
@@ -420,6 +428,7 @@ struct ArmRecomp::Impl {
                 }
             }
 
+            process_state->static_image_published.store(true, std::memory_order_release);
             process_state->initialization = Initialization::Ready;
             LOG_INFO(Core_ARM,
                      "recomp: accepted {}-NSO hybrid batch; guest rtld will apply cross-module "
@@ -517,6 +526,7 @@ struct ArmRecomp::Impl {
         process_state->relocations_committed = true;
         process_state->relocation_writes = committed.relocation_writes;
         process_state->finalization_writes = committed.finalization_writes;
+        process_state->static_image_published.store(true, std::memory_order_release);
         process_state->initialization = Initialization::Ready;
         LOG_INFO(Core_ARM,
                  "recomp: committed {} relocations and {} finalizers for '{}' at {:#x} "
@@ -642,10 +652,38 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread, bool single_step) {
         impl->interrupted.exchange(false, std::memory_order_acq_rel);
     }
 
+    if (True(hr & HaltReason::CacheInvalidation) &&
+        impl->process_state->static_image_published.load(std::memory_order_acquire)) {
+        // IC IVAU/IC IALLU executed by the guest is raised from inside the
+        // nested Dynarmic backend, so the ordinary kernel invalidation fanout
+        // never reaches this wrapper. Make the AOT decision sticky here and
+        // clear every other core's fallback cache as well. The current
+        // fallback already invalidated its own requested range before halting.
+        const bool first_invalidation =
+            !impl->process_state->force_jit.exchange(true, std::memory_order_acq_rel);
+        if (first_invalidation) {
+            LOG_WARNING(Core_ARM,
+                        "recomp: guest invalidated executable code; switching this process "
+                        "permanently to JIT");
+            // Broadcast only the first invalidation. If two fallback cores
+            // raise cache-invalidation halts together, rebroadcasting both can
+            // make them repeatedly clear and halt one another's JIT caches.
+            if (impl->owner_process != nullptr) {
+                for (std::size_t index = 0; index < Core::Hardware::NUM_CPU_CORES; ++index) {
+                    auto* interface = impl->owner_process->GetArmInterface(index);
+                    if (interface != nullptr && interface != this) {
+                        interface->ClearInstructionCache();
+                    }
+                }
+            }
+        }
+    }
+
     // Return to recompiled execution as soon as the PC is covered again, so a
     // single uncovered function costs only the time spent inside it. A process
     // whose image failed validation stays entirely on the JIT.
-    if (impl->process_state->initialization == ArmRecompProcessState::Initialization::Ready &&
+    if (!impl->process_state->force_jit.load(std::memory_order_acquire) &&
+        impl->process_state->initialization == ArmRecompProcessState::Initialization::Ready &&
         impl->lookup && impl->lookup(impl->ctx.pc)) {
         impl->in_fallback = false;
     }
@@ -682,6 +720,16 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         return HaltReason::PrefetchAbort;
     }
 
+    if (impl->process_state->force_jit.load(std::memory_order_acquire)) {
+        if (!EnterFallback(thread)) {
+            LOG_CRITICAL(Core_ARM,
+                         "recomp: executable code was invalidated and no JIT fallback is "
+                         "available");
+            return HaltReason::PrefetchAbort;
+        }
+        return RunFallback(thread);
+    }
+
     // A previous miss handed this thread to the JIT; keep running there until
     // the PC lands back inside recompiled code.
     if (impl->in_fallback) {
@@ -693,6 +741,16 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     while (!impl->ctx.halted) {
         if (impl->interrupted.exchange(false, std::memory_order_acq_rel)) {
             return HaltReason::BreakLoop;
+        }
+
+        // Another core can invalidate executable memory while this one is
+        // between generated blocks. Stop dispatching immutable AOT code at the
+        // next block boundary rather than waiting for this thread to yield.
+        if (impl->process_state->force_jit.load(std::memory_order_acquire)) {
+            if (!EnterFallback(thread)) {
+                return HaltReason::PrefetchAbort;
+            }
+            return RunFallback(thread);
         }
 
         // An SVC parked us last time round; the kernel has now serviced it and
@@ -830,7 +888,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
         return HaltReason::PrefetchAbort;
     }
     if (initialization == ArmRecompProcessState::Initialization::FallbackOnly ||
-        impl->in_fallback) {
+        impl->process_state->force_jit.load(std::memory_order_acquire) || impl->in_fallback) {
         if (!EnterFallback(thread)) {
             return HaltReason::PrefetchAbort;
         }
@@ -863,13 +921,28 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
 }
 
 void ArmRecomp::ClearInstructionCache() {
-    // Statically recompiled code is fixed at build time; there is no
-    // translation cache to invalidate. Self-modifying guest code is
-    // consequently unsupported by this backend by construction.
+    if (impl->process_state->static_image_published.load(std::memory_order_acquire) &&
+        !impl->process_state->force_jit.exchange(true, std::memory_order_acq_rel)) {
+        LOG_WARNING(Core_ARM,
+                    "recomp: executable code cache was cleared; switching this process "
+                    "permanently to JIT");
+    }
+    if (auto* fallback = impl->fallback_signal_target.load(std::memory_order_acquire)) {
+        fallback->ClearInstructionCache();
+    }
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
-    // See ClearInstructionCache.
+    if (impl->process_state->static_image_published.load(std::memory_order_acquire) &&
+        !impl->process_state->force_jit.exchange(true, std::memory_order_acq_rel)) {
+        LOG_WARNING(Core_ARM,
+                    "recomp: executable code at {:#x} (size {:#x}) was invalidated; switching "
+                    "this process permanently to JIT",
+                    addr, size);
+    }
+    if (auto* fallback = impl->fallback_signal_target.load(std::memory_order_acquire)) {
+        fallback->InvalidateCacheRange(addr, size);
+    }
 }
 
 void ArmRecomp::GetContext(Kernel::Svc::ThreadContext& ctx) const {
