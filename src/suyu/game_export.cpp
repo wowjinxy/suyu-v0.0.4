@@ -330,16 +330,13 @@ void GameExportDialog::SetupUi() {
     plat_row->addWidget(platform_combo);
     layout->addLayout(plat_row);
 
-    // Recompiler backend
+    // There is one real AOT compiler. Dynarmic remains the runtime fallback,
+    // not an alternate code generator, and unfinished backends must not be
+    // presented as selectable implementations.
     auto* backend_row = new QHBoxLayout();
-    backend_row->addWidget(new QLabel(tr("AOT Backend:"), this));
-    backend_combo = new QComboBox(this);
-    backend_combo->addItem(tr("Dynarmic (stable)"),
-                           static_cast<int>(RecompileBackend::Dynarmic));
-    backend_combo->addItem(tr("Ballistic (WIP)"),
-                           static_cast<int>(RecompileBackend::Ballistic));
-    backend_combo->setCurrentIndex(0);
-    backend_row->addWidget(backend_combo);
+    backend_row->addWidget(new QLabel(tr("AOT Compiler:"), this));
+    backend_row->addWidget(new QLabel(tr("suyu AArch64 to portable C"), this));
+    backend_row->addStretch();
     layout->addLayout(backend_row);
 
     // AOT options
@@ -1350,14 +1347,14 @@ bool GameExportDialog::WantsCompiledOutput() const {
 
 QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                            const QString& cache_dir,
-                                           RecompileBackend backend,
                                            const QString& game_name) {
     QDir().mkpath(cache_dir);
 
     const QString manifest_path = cache_dir + QDir::separator() + QStringLiteral("aot_manifest.json");
-    // Version 3 records the update-first ExeFS selection policy. Reusing an older cache could pair
-    // generated base-title code with update NSOs extracted during packaging.
-    constexpr int AotManifestVersion = 3;
+    // Version 4 identifies the actual suyu AArch64-to-C generator and records
+    // paths matching the on-disk export. Reusing an older cache would preserve
+    // misleading backend metadata and stale recompiled/ paths.
+    constexpr int AotManifestVersion = 4;
 
     // blockmaps/, ir/ and code/ are debugging material for a codegen stage that
     // no longer exists: nothing in suyu or in the generated project reads any of
@@ -1378,10 +1375,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     }
 
     const bool full_scan = aot_full_scan_checkbox->isChecked();
-    const bool ballistic_requested = backend == RecompileBackend::Ballistic;
-    const QString requested_backend_name =
-        ballistic_requested ? QStringLiteral("ballistic") : QStringLiteral("dynarmic");
-    const QString effective_backend_name = QStringLiteral("dynarmic");
+    const QString generator_name = QStringLiteral("suyu-aarch64-to-c");
     const auto reject_npdm = [this](const QString& message) {
         LOG_ERROR(Frontend, "AOT export rejected main.npdm: {}", message.toStdString());
         QMessageBox::critical(this, tr("AOT Export Failed"), message);
@@ -1421,9 +1415,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const bool same_scan = contents.contains(
                 QStringLiteral("\"full_scan\": ") + (full_scan ? QStringLiteral("true")
                                                                   : QStringLiteral("false")));
-            const bool same_backend = contents.contains(
-                QStringLiteral("\"effective_backend\": \"") + effective_backend_name +
-                QStringLiteral("\""));
+            const bool same_generator = contents.contains(
+                QStringLiteral("\"generator\": \"") + generator_name + QStringLiteral("\""));
             const bool architecture_validated =
                 contents.contains(QStringLiteral("\"architecture\": \"aarch64-npdm\""));
             const bool has_recompiled_project =
@@ -1432,7 +1425,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !WantsCompiledOutput() ||
                 QFile::exists(cache_dir + QDir::separator() + QStringLiteral("launcher") +
                               QDir::separator() + QStringLiteral("static_launcher.exe"));
-            if (same_manifest_version && same_scan && same_backend && architecture_validated &&
+            if (same_manifest_version && same_scan && same_generator && architecture_validated &&
                 has_recompiled_project && has_required_launcher) {
                 LOG_INFO(Frontend, "Reusing completed AOT cache at {}", cache_dir.toStdString());
                 return cache_dir;
@@ -2160,8 +2153,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         QTextStream out(&manifest);
         out << "{\n";
         out << "  \"version\": " << AotManifestVersion << ",\n";
-        out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
-        out << "  \"effective_backend\": \"" << effective_backend_name << "\",\n";
+        out << "  \"generator\": \"" << generator_name << "\",\n";
         out << "  \"architecture\": \"aarch64-npdm\",\n";
         out << "  \"full_scan\": " << (full_scan ? "true" : "false") << ",\n";
         out << "  \"total_modules\": " << module_results.size() << ",\n";
@@ -2198,7 +2190,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         }
         out << "  \"recompiled_project\": \"exefs/<module>/ (buildable C, cross-platform CMake; "
                "generated units in <module>/src, build output in <module>/build)\",\n";
-        out << "  \"native_build_scripts\": [\"recompiled/build_native_windows.cmd\", \"recompiled/build_native_unix.sh\"],\n";
+        out << "  \"native_build_scripts\": [\"exefs/build_native_windows.cmd\", \"exefs/build_native_unix.sh\"],\n";
         out << "  \"requires_runtime_codegen\": false,\n";
         out << "  \"modules\": [\n";
         for (size_t i = 0; i < module_results.size(); ++i) {
@@ -2235,8 +2227,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 out << "      \"static_coverage_report\": \"exefs/" << mod.name
                     << "/recomp_static_coverage.json\",\n";
             }
-            out << "      \"project_directory\": \"recompiled/" << mod.name << "\",\n";
-            out << "      \"sources_directory\": \"recompiled/" << mod.name << "/src\"";
+            out << "      \"project_directory\": \"exefs/" << mod.name << "\",\n";
+            out << "      \"sources_directory\": \"exefs/" << mod.name << "/src\"";
             if (dump_debug_artifacts) {
                 out << ",\n      \"blockmap_file\": \"debug/blockmaps/" << mod.name
                     << ".blockmap\",\n";
@@ -2247,13 +2239,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             out << "    }" << (i + 1 < module_results.size() ? "," : "") << "\n";
         }
         out << "  ],\n";
-             out << "  \"comment\": \"Dynarmic A64 frontend export. suyu serializes translated IR, "
-                 "raw guest code slices, and block maps as inputs for a future custom runtime/codegen "
-                 "stage instead of bundling the existing frontend executable."
-                 << (ballistic_requested
-                         ? " Ballistic was requested but currently falls back to the Dynarmic export path until a distinct Ballistic serializer is wired."
-                         : "")
-                 << "\"\n";
+        out << "  \"comment\": \"suyu's native AArch64-to-C compiler emits buildable C for "
+               "supported guest instructions. Uncovered code is recorded explicitly and uses the "
+               "Dynarmic JIT in the hosted runtime. Optional IR and block dumps are diagnostics only.\"\n";
         out << "}\n";
         manifest.close();
     }
@@ -2850,8 +2838,6 @@ void GameExportDialog::OnExport() {
 
     const auto platform =
         static_cast<TargetPlatform>(platform_combo->currentData().toInt());
-    const auto backend =
-        static_cast<RecompileBackend>(backend_combo->currentData().toInt());
 #ifdef _WIN32
     const bool compiled_package_supported = platform == TargetPlatform::Windows;
 #else
@@ -2923,11 +2909,6 @@ void GameExportDialog::OnExport() {
     status_label->setText(tr("Preparing AOT export..."));
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
-    if (backend == RecompileBackend::Ballistic) {
-        status_label->setText(tr("Ballistic export is not wired yet; using Dynarmic export artifacts for this run."));
-        QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-    }
-
     try {
     // Step 1: Create temporary working directories
     const QString work_dir = output_dir + QDir::separator() +
@@ -2965,13 +2946,10 @@ void GameExportDialog::OnExport() {
     progress_bar->setValue(15);
 
     // Step 3: AOT pre-compilation
-    status_label->setText(tr("Running AOT pre-compilation (%1)...")
-                              .arg(backend == RecompileBackend::Ballistic
-                                       ? QStringLiteral("Ballistic")
-                                       : QStringLiteral("Dynarmic")));
+    status_label->setText(tr("Running the suyu AArch64-to-C compiler..."));
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
-    const QString cache_result = RunAotPrecompile(exefs_work, cache_work, backend, game_name);
+    const QString cache_result = RunAotPrecompile(exefs_work, cache_work, game_name);
     if (cache_result.isEmpty()) {
         status_label->setText(tr("AOT pre-compilation failed."));
         progress_bar->setValue(0);

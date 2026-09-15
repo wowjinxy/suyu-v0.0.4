@@ -84,11 +84,6 @@ public:
         MacOS,
     };
 
-    enum class RecompileBackend {
-        Dynarmic,   ///< Default — mature and stable
-        Ballistic,  ///< WIP — from pound-emu/ballistic
-    };
-
 signals:
     void ExportFinished(bool success, const QString& output_path);
 
@@ -121,7 +116,7 @@ private:
     /// AOT export: scan AArch64 code and emit portable C projects.
     /// Returns path to the generated cache directory, or empty string on failure.
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,
-                             RecompileBackend backend, const QString& game_name);
+                             const QString& game_name);
 
     /// Package the translated output into a platform-specific export bundle.
     bool PackageNativeExport(const QString& rom_path, const QString& cache_dir,
@@ -131,7 +126,6 @@ private:
     QLineEdit* rom_path_edit{};
     QLineEdit* output_path_edit{};
     QComboBox* platform_combo{};
-    QComboBox* backend_combo{};
     QCheckBox* include_save_data_checkbox{};
     QCheckBox* include_shader_cache_checkbox{};
     QCheckBox* include_custom_config_checkbox{};
