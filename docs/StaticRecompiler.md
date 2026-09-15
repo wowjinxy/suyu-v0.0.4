@@ -41,6 +41,32 @@ rasterizer, and runtime shader translation.
 
 ## Milestones
 
+### Primary-runtime promotion gate
+
+The repository should be renamed to `suyu-recompiler` only after the static-first path is the
+normal, continuously tested way to launch a compatible title. “Primary” does not mean deleting
+Dynarmic: dynamic code, invalidated executable pages, and untranslated instructions still need a
+correct fallback. It does require all of the following:
+
+- [x] Desktop builds include the canonical `suyu_recomp` compiler by default.
+- [x] Every frontend launch path selects a matching per-title AOT cache before process creation.
+- [x] Executable-code invalidation permanently and safely moves that process to Dynarmic.
+- [ ] Version the complete generated-image/host ABI and reject incompatible images before calling
+  any image-owned function.
+- [ ] Account for AOT instructions in CoreTiming and bound each dispatch slice so guest scheduling,
+  interrupts, and timers remain deterministic.
+- [ ] Differentially test representative scalar, SIMD/FP, memory, atomic, SVC, and AOT/JIT handoff
+  cases against Dynarmic with synthetic inputs.
+- [ ] Report per-process AOT instructions, fallback instructions/transitions, and uncovered PCs so
+  “static-first” is measured rather than inferred from successful compilation.
+- [ ] Pass an end-to-end open-homebrew launch test through the hosted runtime on Windows and Linux,
+  including input, graphics, audio, filesystem/save I/O, and clean shutdown.
+- [ ] Keep the AOT path within an agreed performance envelope of Dynarmic on the same workload; a
+  default path that is pathologically slower is not ready for promotion.
+
+These are correctness and product gates, not coverage theater. A proprietary title compiling to a
+large C tree, or reaching a menu once, is useful evidence but cannot by itself satisfy them.
+
 ### M0: canonical emitter CLI
 
 - One frontend for the canonical emitter; no duplicated decoder/runtime.
