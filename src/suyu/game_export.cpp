@@ -2852,6 +2852,19 @@ void GameExportDialog::OnExport() {
         static_cast<TargetPlatform>(platform_combo->currentData().toInt());
     const auto backend =
         static_cast<RecompileBackend>(backend_combo->currentData().toInt());
+#ifdef _WIN32
+    const bool compiled_package_supported = platform == TargetPlatform::Windows;
+#else
+    const bool compiled_package_supported = false;
+#endif
+    if (WantsCompiledOutput() && !compiled_package_supported) {
+        QMessageBox::critical(
+            this, tr("Unsupported Build Target"),
+            tr("Compiled game packages are currently implemented only for a Windows target "
+               "built on Windows. Choose Source to generate portable C for this target, then "
+               "build the modules on the target platform."));
+        return;
+    }
     const bool include_save_data = include_save_data_checkbox->isChecked();
     const bool include_shader_cache = include_shader_cache_checkbox->isChecked();
     const bool include_custom_config = include_custom_config_checkbox->isChecked();
@@ -3043,7 +3056,7 @@ void GameExportDialog::OnExport() {
                "- Runtime DLLs (FFmpeg, Vulkan, OpenSSL) alongside the exe\n\n"
                "Just run %2.exe.")
                 .arg(final_path, game_name));
-    } else {
+    } else if (platform == TargetPlatform::Windows) {
         QMessageBox::information(
             this, tr("AOT Export Complete"),
             tr("Game exported as C source to:\n%1\n\n"
@@ -3057,6 +3070,15 @@ void GameExportDialog::OnExport() {
                "fallback for code the static translator does not cover.\n\n"
                "(Choose \"Build\" instead of \"Source\" as the Export Format to have suyu compile "
                "this for you automatically.)")
+                .arg(final_path));
+    } else {
+        QMessageBox::information(
+            this, tr("AOT Source Export Complete"),
+            tr("Portable AOT source artifacts were exported to:\n%1\n\n"
+               "This Linux/macOS bundle contains the generated C projects, guest segments, and "
+               "build scripts. It does not yet contain a runnable suyu frontend for that target. "
+               "Build the modules on the target platform and use them with a matching suyu "
+               "runtime.")
                 .arg(final_path));
     }
     } catch (const std::exception& e) {
