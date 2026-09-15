@@ -172,7 +172,13 @@ if((BUILD_TESTING OR YUZU_TESTS) AND NOT CMAKE_CROSSCOMPILING)
             "-DRECOMP_C_COMPILER=${CMAKE_C_COMPILER}"
             "-P" "${CMAKE_CURRENT_LIST_DIR}/tests/nso_emit.cmake"
     )
-    set_tests_properties(static_recompiler_nso_emit PROPERTIES TIMEOUT 120)
+    if(WIN32 AND MSVC)
+        # MSVC can spend more than two minutes compiling the generated static image even after
+        # emission and configuration have succeeded on hosted runners.
+        set_tests_properties(static_recompiler_nso_emit PROPERTIES TIMEOUT 300)
+    else()
+        set_tests_properties(static_recompiler_nso_emit PROPERTIES TIMEOUT 120)
+    endif()
 
     if(WIN32)
         find_program(SUYU_RECOMPILER_POWERSHELL NAMES pwsh powershell)

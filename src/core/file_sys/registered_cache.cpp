@@ -645,18 +645,28 @@ void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
         if (file == nullptr)
             continue;
         const auto nca = std::make_shared<NCA>(parser(file, id));
-        if (nca->GetStatus() != Loader::ResultStatus::Success ||
-            nca->GetType() != NCAContentType::Meta || nca->GetSubdirectories().empty()) {
+        const auto status = nca->GetStatus();
+        if (status != Loader::ResultStatus::Success) {
+            // A failed NCA has no initialized reader, so querying its type or sections while
+            // diagnosing the failure dereferences null. Corrupt cache entries must be skipped.
+            LOG_DEBUG(Loader, "DIAG meta skipped: id={} status={}", Common::HexToString(id),
+                      static_cast<int>(status));
+            continue;
+        }
+
+        const auto type = nca->GetType();
+        const auto& subdirectories = nca->GetSubdirectories();
+        if (type != NCAContentType::Meta || subdirectories.empty()) {
             // Silently skipping a meta NCA means the title is simply absent from
             // this cache with no trace in the log, which is indistinguishable
             // from never having been installed.
             LOG_DEBUG(Loader, "DIAG meta skipped: id={} status={} type={} subdirs={}",
-                      Common::HexToString(id), static_cast<int>(nca->GetStatus()),
-                      static_cast<int>(nca->GetType()), nca->GetSubdirectories().size());
+                      Common::HexToString(id), static_cast<int>(status), static_cast<int>(type),
+                      subdirectories.size());
             continue;
         }
 
-        const auto section0 = nca->GetSubdirectories()[0];
+        const auto section0 = subdirectories[0];
 
         for (const auto& section0_file : section0->GetFiles()) {
             if (section0_file->GetExtension() != "cnmt")

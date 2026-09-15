@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -19,7 +20,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <locale>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -270,8 +274,14 @@ inline std::string Xsp(u32 r) {
     return "c->x[" + std::to_string(r) + "]";
 }
 
-// Append C for one instruction. Returns false if the instruction terminates the block.
-inline bool Translate(u32 i, u64 pc, std::string& out) {
+// Append C for one instruction. Returns false if the instruction terminates the block. When
+// supplied, known_unhandled distinguishes an explicit runtime fallback from a translated
+// instruction; the return value alone cannot do that because fallbacks deliberately leave the
+// current block open.
+inline bool Translate(u32 i, u64 pc, std::string& out, bool* known_unhandled = nullptr) {
+    if (known_unhandled) {
+        *known_unhandled = false;
+    }
     char buf[256];
     // Appends in place. Taking a string_view and appending piecewise (rather
     // than `out += "    " + s + "\n"`) matters at scale: that expression built
@@ -281,6 +291,16 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         out.append("    ", 4);
         out.append(s);
         out.push_back('\n');
+    };
+    const auto put_unhandled = [&]() {
+        if (known_unhandled) {
+            *known_unhandled = true;
+        }
+        char fallback[128];
+        snprintf(fallback, sizeof fallback,
+                 "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
+                 (unsigned long long)pc);
+        put(fallback);
     };
     const u64 next = pc + 4;
 
@@ -400,10 +420,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         // ROR is reserved for ADD/SUB shifted register - decoding it as a shift
         // would silently invent an instruction the CPU does not have.
         if (shift == 3) {
-            snprintf(buf, sizeof buf,
-                     "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
-                     (unsigned long long)pc);
-            put(buf);
+            put_unhandled();
             return true;
         }
         std::string rmv = shifted_operand(Xz(rm), shift, imm6, sf);
@@ -469,10 +486,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         } else {
             // size==2/opc==3 and the size==3/opc>=2 combinations are not
             // defined scalar loads/stores in this addressing class.
-            snprintf(buf, sizeof buf,
-                     "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
-                     (unsigned long long)pc);
-            put(buf);
+            put_unhandled();
             return true;
         }
         return true;
@@ -759,10 +773,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     // this complete encoding group to the fallback engine, which owns the
     // kernel's exclusive monitor and implements the required memory ordering.
     if ((i & 0x3F000000) == 0x08000000) {
-        snprintf(buf, sizeof buf,
-                 "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
-                 (unsigned long long)pc);
-        put(buf);
+        put_unhandled();
         return true;
     }
 
@@ -1764,10 +1775,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     // hand-off to the fallback engine correct: the remaining instructions in
     // this block must not run twice, since the fallback resumes at this same
     // PC and will execute them itself.
-    snprintf(buf, sizeof buf,
-             "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
-             (unsigned long long)pc);
-    put(buf); return true;
+    put_unhandled();
+    return true;
 }
 
 inline std::string FuncName(const std::string& mod, u64 v) {
@@ -1841,11 +1850,68 @@ inline bool IsModuleIdentifier(std::string_view value) {
 const char* RuntimeH();
 const char* RuntimeC();
 
+struct UnhandledSite {
+    size_t count{};
+    u32 example_instruction{};
+    u64 example_pc{};
+};
+
+// Top-level AArch64 encoding group selected by instruction bits 28:25.
+inline const char* EncodingGroupName(u32 group) {
+    switch (group & 0xF) {
+    case 0x0:
+        return "reserved/sme";
+    case 0x1:
+    case 0x3:
+        return "unallocated";
+    case 0x2:
+        return "sve";
+    case 0x8:
+    case 0x9:
+        return "dp-immediate";
+    case 0xA:
+    case 0xB:
+        return "branch/exception/system";
+    case 0x4:
+    case 0x6:
+    case 0xC:
+    case 0xE:
+        return "load/store";
+    case 0x5:
+    case 0xD:
+        return "dp-register";
+    case 0x7:
+    case 0xF:
+        return "dp-simd/fp";
+    default:
+        return "unknown";
+    }
+}
+
 // Stats returned to the caller for manifest/reporting.
 struct RecompileStats {
-    size_t blocks = 0;
-    size_t instructions = 0;
-    size_t translated_terminators = 0;
+    size_t blocks{};
+    size_t instructions{}; ///< All four-byte words in the input text segment.
+    size_t translated_terminators{};
+    size_t visited_instructions{};       ///< Instructions walked while emitting discovered blocks.
+    size_t known_unhandled_instructions{}; ///< Instructions explicitly sent to runtime fallback.
+    std::map<u32, size_t> known_unhandled_by_op0;
+    std::map<u32, UnhandledSite> known_unhandled_by_signature;
+
+    [[nodiscard]] size_t KnownTranslatedInstructions() const {
+        return visited_instructions - known_unhandled_instructions;
+    }
+
+    [[nodiscard]] double KnownUnhandledFraction() const {
+        return visited_instructions
+                   ? static_cast<double>(known_unhandled_instructions) /
+                         static_cast<double>(visited_instructions)
+                   : 0.0;
+    }
+
+    [[nodiscard]] double KnownTranslatedFraction() const {
+        return visited_instructions ? 1.0 - KnownUnhandledFraction() : 0.0;
+    }
 };
 
 // Module-relative virtual addresses needed by the generated standalone loader. Hosted suyu uses
@@ -2130,9 +2196,27 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         bool open = true;
         for (u32 k = 0; k < b.count; ++k) {
             body.clear();
-            open = Translate(p[first + k], b.vaddr + (u64)k * 4, body);
+            const u32 instruction = p[first + k];
+            const u64 instruction_pc = b.vaddr + static_cast<u64>(k) * 4;
+            bool known_unhandled = false;
+            open = Translate(instruction, instruction_pc, body, &known_unhandled);
             rcu += body;
-            if (!open) { ++stats.translated_terminators; break; }
+            ++stats.visited_instructions;
+            if (known_unhandled) {
+                ++stats.known_unhandled_instructions;
+                ++stats.known_unhandled_by_op0[(instruction >> 25) & 0xF];
+                auto& site =
+                    stats.known_unhandled_by_signature[instruction & 0xFFC00000U];
+                if (site.count == 0) {
+                    site.example_instruction = instruction;
+                    site.example_pc = instruction_pc;
+                }
+                ++site.count;
+            }
+            if (!open) {
+                ++stats.translated_terminators;
+                break;
+            }
         }
         // A block that ends by running off its own end still has to hand the
         // dispatcher an absolute guest address, exactly as every branch
@@ -2541,6 +2625,83 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     write("main.c", mc.str());
     write("recomp_export.c", ex.str());
     write("CMakeLists.txt", cm.str());
+
+    // This is static translation coverage, not runtime execution coverage. It reports explicit
+    // fallback sites honestly as "known unhandled" because a decoder bug can still translate an
+    // instruction incorrectly without appearing here.
+    {
+        std::ostringstream coverage;
+        coverage.imbue(std::locale::classic());
+        coverage << "{\n"
+                 << "  \"schema_version\": 1,\n"
+                 << "  \"module\": \"" << mod << "\",\n"
+                 << "  \"coverage_scope\": \"emitted text words, including unreachable words and padding\",\n"
+                 << "  \"text_base\": \"0x" << std::hex << base << std::dec << "\",\n"
+                 << "  \"text_size_bytes\": " << n_bytes << ",\n"
+                 << "  \"text_words\": " << stats.instructions << ",\n"
+                 << "  \"instructions_visited\": " << stats.visited_instructions << ",\n"
+                 << "  \"known_translated_instructions\": "
+                 << stats.KnownTranslatedInstructions() << ",\n"
+                 << "  \"known_unhandled_instructions\": "
+                 << stats.known_unhandled_instructions << ",\n";
+        if (stats.visited_instructions != 0) {
+            coverage << std::fixed << std::setprecision(6)
+                     << "  \"known_translated_percent\": "
+                     << stats.KnownTranslatedFraction() * 100.0 << ",\n"
+                     << "  \"known_unhandled_percent\": "
+                     << stats.KnownUnhandledFraction() * 100.0 << ",\n";
+        } else {
+            coverage << "  \"known_translated_percent\": null,\n"
+                     << "  \"known_unhandled_percent\": null,\n";
+        }
+
+        coverage << "  \"known_unhandled_by_op0\": [";
+        bool first_group = true;
+        for (const auto& [group, count] : stats.known_unhandled_by_op0) {
+            coverage << (first_group ? "\n" : ",\n")
+                     << "    { \"op0\": " << group << ", \"name\": \""
+                     << EncodingGroupName(group) << "\", \"count\": " << count << " }";
+            first_group = false;
+        }
+        coverage << (first_group ? "]" : "\n  ]") << ",\n";
+
+        std::vector<std::pair<u32, UnhandledSite>> ranked{
+            stats.known_unhandled_by_signature.begin(),
+            stats.known_unhandled_by_signature.end()};
+        std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+            if (left.second.count != right.second.count) {
+                return left.second.count > right.second.count;
+            }
+            return left.first < right.first;
+        });
+        coverage << "  \"known_unhandled_by_signature\": [";
+        bool first_signature = true;
+        size_t shown = 0;
+        for (const auto& [signature, site] : ranked) {
+            if (shown++ == 64) {
+                break;
+            }
+            char signature_hex[11];
+            char instruction_hex[11];
+            char pc_hex[19];
+            snprintf(signature_hex, sizeof signature_hex, "0x%08X", signature);
+            snprintf(instruction_hex, sizeof instruction_hex, "0x%08X",
+                     site.example_instruction);
+            snprintf(pc_hex, sizeof pc_hex, "0x%llX",
+                     static_cast<unsigned long long>(site.example_pc));
+            coverage << (first_signature ? "\n" : ",\n")
+                     << "    { \"signature\": \"" << signature_hex << "\", \"count\": "
+                     << site.count << ", \"example_instruction\": \"" << instruction_hex
+                     << "\", \"example_pc\": \"" << pc_hex << "\", \"group\": \""
+                     << EncodingGroupName((site.example_instruction >> 25) & 0xF) << "\" }";
+            first_signature = false;
+        }
+        coverage << (first_signature ? "]" : "\n  ]") << ",\n"
+                 << "  \"distinct_unhandled_signatures\": "
+                 << stats.known_unhandled_by_signature.size() << "\n"
+                 << "}\n";
+        write("recomp_static_coverage.json", coverage.str());
+    }
 
     // Bundle text/rodata/data as binary blobs so the exe can load them at startup
     {

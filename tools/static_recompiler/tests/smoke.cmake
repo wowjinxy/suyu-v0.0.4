@@ -36,11 +36,16 @@ if(NOT emit_stdout MATCHES
    "Generated 2 blocks from 4 AArch64 instructions \\(1 translated terminators\\).")
     message(FATAL_ERROR "Unexpected emitter statistics:\n${emit_stdout}")
 endif()
+if(NOT emit_stdout MATCHES
+   "Known static decoder coverage \\(emitted text words\\): 4/4 instructions \\(100.00% translated, 0.00% explicit fallback\\).")
+    message(FATAL_ERROR "Unexpected static decoder coverage:\n${emit_stdout}")
+endif()
 
 foreach(generated_file
         CMakeLists.txt
         recomp_runtime.c
         recomp_runtime.h
+        recomp_static_coverage.json
         recomp_export.c
         main.c
         data/text.bin
@@ -50,6 +55,28 @@ foreach(generated_file
         message(FATAL_ERROR "Emitter did not create ${generated_file}")
     endif()
 endforeach()
+
+file(READ "${generated_dir}/recomp_static_coverage.json" coverage_json)
+string(JSON coverage_schema GET "${coverage_json}" schema_version)
+string(JSON coverage_module GET "${coverage_json}" module)
+string(JSON coverage_scope GET "${coverage_json}" coverage_scope)
+string(JSON coverage_text_base GET "${coverage_json}" text_base)
+string(JSON coverage_text_size GET "${coverage_json}" text_size_bytes)
+string(JSON coverage_visited GET "${coverage_json}" instructions_visited)
+string(JSON coverage_translated GET "${coverage_json}" known_translated_instructions)
+string(JSON coverage_unhandled GET "${coverage_json}" known_unhandled_instructions)
+string(JSON coverage_signatures GET "${coverage_json}" distinct_unhandled_signatures)
+if(NOT coverage_schema EQUAL 1 OR
+   NOT coverage_module STREQUAL "smoke" OR
+   NOT coverage_scope STREQUAL "emitted text words, including unreachable words and padding" OR
+   NOT coverage_text_base STREQUAL "0x1000" OR
+   NOT coverage_text_size EQUAL 16 OR
+   NOT coverage_visited EQUAL 4 OR
+   NOT coverage_translated EQUAL 4 OR
+   NOT coverage_unhandled EQUAL 0 OR
+   NOT coverage_signatures EQUAL 0)
+    message(FATAL_ERROR "Generated static coverage report is incorrect:\n${coverage_json}")
+endif()
 
 file(READ "${generated_dir}/recomp_export.c" generated_export)
 string(REGEX MATCHALL "0x00" zero_identity_bytes "${generated_export}")

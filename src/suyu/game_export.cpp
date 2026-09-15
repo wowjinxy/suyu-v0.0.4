@@ -58,6 +58,7 @@
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/nca_metadata.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
@@ -595,6 +596,9 @@ struct NsoAnalysisResult {
     u32 bss_size{};
     u32 total_blocks{};
     u32 total_instructions{};
+    u64 recompile_instructions_visited{};
+    u64 recompile_known_unhandled{};
+    bool has_recompile_coverage{};
     /// Guest address of the first real instruction. An NSO's .text does not
     /// start with code, so this is not simply text_vaddr.
     u64 entry_vaddr{};
@@ -971,9 +975,28 @@ static FileSys::VirtualDir ExtractExeFsFromRom(const std::string& rom_path) {
         if (auto exefs = nsp->GetExeFS()) {
             return exefs; // Pre-extracted NSP - already populated.
         }
+        // Updates replace the executable filesystem wholesale. Recompiling the base ExeFS while
+        // the emulator boots an update produces generated code whose NSO identities cannot match
+        // the live process. Prefer the update Program NCA and fall back to the base only when the
+        // container does not carry a usable update.
+        const auto base_title_id = nsp->GetProgramTitleID();
+        if (base_title_id != 0) {
+            const auto update_title_id = FileSys::GetUpdateTitleID(base_title_id);
+            if (const auto update_nca =
+                    nsp->GetNCA(update_title_id, FileSys::ContentRecordType::Program,
+                                FileSys::TitleType::Update)) {
+                if (auto update_exefs = update_nca->GetExeFS()) {
+                    LOG_INFO(Frontend,
+                             "AOT: using update ExeFS ({:016X}) instead of base ExeFS ({:016X})",
+                             update_title_id, base_title_id);
+                    return update_exefs;
+                }
+            }
+        }
+
         const auto t_nca_start = std::chrono::steady_clock::now();
         const auto program_nca =
-            nsp->GetNCA(nsp->GetProgramTitleID(), FileSys::ContentRecordType::Program);
+            nsp->GetNCA(base_title_id, FileSys::ContentRecordType::Program);
         const auto t_nca_got = std::chrono::steady_clock::now();
         const auto exefs = program_nca ? program_nca->GetExeFS() : nullptr;
         const auto t_exefs_got = std::chrono::steady_clock::now();
@@ -1332,6 +1355,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     QDir().mkpath(cache_dir);
 
     const QString manifest_path = cache_dir + QDir::separator() + QStringLiteral("aot_manifest.json");
+    // Version 3 records the update-first ExeFS selection policy. Reusing an older cache could pair
+    // generated base-title code with update NSOs extracted during packaging.
+    constexpr int AotManifestVersion = 3;
 
     // blockmaps/, ir/ and code/ are debugging material for a codegen stage that
     // no longer exists: nothing in suyu or in the generated project reads any of
@@ -1390,6 +1416,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         QFile manifest(manifest_path);
         if (manifest.open(QIODevice::ReadOnly | QIODevice::Text)) {
             const QString contents = QString::fromUtf8(manifest.readAll());
+            const bool same_manifest_version = contents.contains(
+                QStringLiteral("\"version\": %1,").arg(AotManifestVersion));
             const bool same_scan = contents.contains(
                 QStringLiteral("\"full_scan\": ") + (full_scan ? QStringLiteral("true")
                                                                   : QStringLiteral("false")));
@@ -1404,8 +1432,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !WantsCompiledOutput() ||
                 QFile::exists(cache_dir + QDir::separator() + QStringLiteral("launcher") +
                               QDir::separator() + QStringLiteral("static_launcher.exe"));
-            if (same_scan && same_backend && architecture_validated && has_recompiled_project &&
-                has_required_launcher) {
+            if (same_manifest_version && same_scan && same_backend && architecture_validated &&
+                has_recompiled_project && has_required_launcher) {
                 LOG_INFO(Frontend, "Reusing completed AOT cache at {}", cache_dir.toStdString());
                 return cache_dir;
             }
@@ -1581,10 +1609,12 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                   fallback_to_interpreter_checkbox->isChecked();
 
     u64 recomp_total_blocks = 0;
+    u64 recomp_instructions_visited = 0;
+    u64 recomp_known_unhandled = 0;
     QStringList recomp_module_dirs;
     QStringList fallback_modules;
 
-    for (const auto& mod : module_results) {
+    for (auto& mod : module_results) {
         if (mod.text_bytes.empty()) {
             continue;
         }
@@ -1648,9 +1678,6 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             LOG_WARNING(Frontend, "Module {} fell back to dynarmic interpreter", mod.name.toStdString());
             continue;
         }
-
-        recomp_total_blocks += stats.blocks;
-        recomp_module_dirs.append(mod.name);
 
         // Actually build it (only in Build mode).
         const QString cmake = WantsCompiledOutput() ? FindBestCmakeExecutable() : QString();
@@ -1751,6 +1778,25 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             }
             LOG_INFO(Frontend, "Built recompiled module {}: {}", mod.name.toStdString(),
                      produced.join(QStringLiteral(", ")).toStdString());
+        }
+
+        // Source exports are usable as soon as emission succeeds. Build exports count a module
+        // only after configure, compilation, and output validation succeed; otherwise a fallback
+        // module would also be registered as statically linked code.
+        recomp_total_blocks += stats.blocks;
+        recomp_instructions_visited += stats.visited_instructions;
+        recomp_known_unhandled += stats.known_unhandled_instructions;
+        mod.recompile_instructions_visited = stats.visited_instructions;
+        mod.recompile_known_unhandled = stats.known_unhandled_instructions;
+        mod.has_recompile_coverage = true;
+        recomp_module_dirs.append(mod.name);
+        if (stats.visited_instructions != 0) {
+            LOG_INFO(Frontend,
+                     "Static decoder coverage [{}] (emitted text words): {}/{} known translated "
+                     "({:.2f}%), {} explicit fallbacks ({:.2f}%)",
+                     mod.name.toStdString(), stats.KnownTranslatedInstructions(),
+                     stats.visited_instructions, stats.KnownTranslatedFraction() * 100.0,
+                     stats.known_unhandled_instructions, stats.KnownUnhandledFraction() * 100.0);
         }
     }
 
@@ -2112,7 +2158,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     if (manifest.open(QIODevice::WriteOnly | QIODevice::Text)) {
         QTextStream out(&manifest);
         out << "{\n";
-        out << "  \"version\": 2,\n";
+        out << "  \"version\": " << AotManifestVersion << ",\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
         out << "  \"effective_backend\": \"" << effective_backend_name << "\",\n";
         out << "  \"architecture\": \"aarch64-npdm\",\n";
@@ -2125,6 +2171,30 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         out << "  \"ir_translation_failures\": " << total_ir_failures << ",\n";
         out << "  \"host_machine_code_blocks\": 0,\n";
         out << "  \"recompiled_c_blocks\": " << recomp_total_blocks << ",\n";
+        out << "  \"recompile_coverage_scope\": \"emitted text words, including unreachable words and padding\",\n";
+        out << "  \"recompile_instructions_visited\": " << recomp_instructions_visited
+            << ",\n";
+        out << "  \"recompile_known_translated_instructions\": "
+            << (recomp_instructions_visited - recomp_known_unhandled) << ",\n";
+        out << "  \"recompile_known_unhandled_instructions\": " << recomp_known_unhandled
+            << ",\n";
+        if (recomp_instructions_visited != 0) {
+            out << "  \"recompile_known_translated_percent\": "
+                << QString::number(
+                       100.0 * static_cast<double>(recomp_instructions_visited -
+                                                   recomp_known_unhandled) /
+                           static_cast<double>(recomp_instructions_visited),
+                       'f', 6)
+                << ",\n";
+            out << "  \"recompile_known_unhandled_percent\": "
+                << QString::number(100.0 * static_cast<double>(recomp_known_unhandled) /
+                                       static_cast<double>(recomp_instructions_visited),
+                                   'f', 6)
+                << ",\n";
+        } else {
+            out << "  \"recompile_known_translated_percent\": null,\n";
+            out << "  \"recompile_known_unhandled_percent\": null,\n";
+        }
         out << "  \"recompiled_project\": \"recompiled/<module>/ (buildable C, cross-platform CMake; "
                "generated units in <module>/src, build output in <module>/build)\",\n";
         out << "  \"native_build_scripts\": [\"recompiled/build_native_windows.cmd\", \"recompiled/build_native_unix.sh\"],\n";
@@ -2143,6 +2213,27 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             out << "      \"data_size\": " << mod.data_size << ",\n";
             out << "      \"blocks\": " << mod.total_blocks << ",\n";
             out << "      \"instructions\": " << mod.total_instructions << ",\n";
+            if (mod.has_recompile_coverage) {
+                out << "      \"recompile_instructions_visited\": "
+                    << mod.recompile_instructions_visited << ",\n";
+                out << "      \"recompile_known_translated_instructions\": "
+                    << (mod.recompile_instructions_visited - mod.recompile_known_unhandled)
+                    << ",\n";
+                out << "      \"recompile_known_unhandled_instructions\": "
+                    << mod.recompile_known_unhandled << ",\n";
+                if (mod.recompile_instructions_visited != 0) {
+                    out << "      \"recompile_known_unhandled_percent\": "
+                        << QString::number(
+                               100.0 * static_cast<double>(mod.recompile_known_unhandled) /
+                                   static_cast<double>(mod.recompile_instructions_visited),
+                               'f', 6)
+                        << ",\n";
+                } else {
+                    out << "      \"recompile_known_unhandled_percent\": null,\n";
+                }
+                out << "      \"static_coverage_report\": \"exefs/" << mod.name
+                    << "/recomp_static_coverage.json\",\n";
+            }
             out << "      \"project_directory\": \"recompiled/" << mod.name << "\",\n";
             out << "      \"sources_directory\": \"recompiled/" << mod.name << "/src\"";
             if (dump_debug_artifacts) {

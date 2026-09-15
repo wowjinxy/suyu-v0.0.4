@@ -17,6 +17,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <new>
@@ -750,6 +751,7 @@ bool ValidateGeneratedProject(const Options& options, bool expect_rodata, bool e
         "recomp_export.c",
         "recomp_runtime.c",
         "recomp_runtime.h",
+        "recomp_static_coverage.json",
         "data/text.bin",
         std::filesystem::path{"src"} / ("recompiled_" + options.module + ".c"),
         std::filesystem::path{"src"} / ("recompiled_" + options.module + "_0.c"),
@@ -773,7 +775,20 @@ bool ValidateGeneratedProject(const Options& options, bool expect_rodata, bool e
 void PrintGenerationResult(const Options& options, const suyu::recomp::RecompileStats& stats) {
     std::cout << "Generated " << stats.blocks << " blocks from " << stats.instructions
               << " AArch64 instructions (" << stats.translated_terminators
-              << " translated terminators).\nOutput: " << PathToUtf8(options.output_path) << '\n';
+              << " translated terminators).\n";
+    if (stats.visited_instructions == 0) {
+        std::cout << "Known static decoder coverage: N/A (no emitted text words).\n";
+    } else {
+        std::cout << "Known static decoder coverage (emitted text words): "
+                  << stats.KnownTranslatedInstructions() << '/' << stats.visited_instructions
+                  << " instructions (" << std::fixed << std::setprecision(2)
+                  << stats.KnownTranslatedFraction() * 100.0 << "% translated, "
+                  << stats.KnownUnhandledFraction() * 100.0 << "% explicit fallback).\n"
+                  << std::defaultfloat;
+    }
+    std::cout << "Coverage report: "
+              << PathToUtf8(options.output_path / "recomp_static_coverage.json")
+              << "\nOutput: " << PathToUtf8(options.output_path) << '\n';
 }
 
 int InspectNso(const Options& options) {
@@ -1434,6 +1449,7 @@ int Run(int argc, char** argv) {
             "recomp_export.c",
             "recomp_runtime.c",
             "recomp_runtime.h",
+            "recomp_static_coverage.json",
             "data/text.bin",
             std::filesystem::path{"src"} / ("recompiled_" + options.module + ".c"),
             std::filesystem::path{"src"} / ("recompiled_" + options.module + "_0.c"),
@@ -1447,10 +1463,7 @@ int Run(int argc, char** argv) {
             }
         }
 
-        std::cout << "Generated " << stats.blocks << " blocks from " << stats.instructions
-                  << " AArch64 instructions (" << stats.translated_terminators
-                  << " translated terminators).\nOutput: " << PathToUtf8(options.output_path)
-                  << '\n';
+        PrintGenerationResult(options, stats);
     } catch (const std::exception& error) {
         std::cerr << "error: generation failed: " << error.what() << '\n';
         return 1;
