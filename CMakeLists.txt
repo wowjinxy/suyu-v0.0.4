@@ -251,7 +251,7 @@ cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT A
 cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CMD "Compile the suyu-cli executable" ON "NOT ANDROID" OFF)
-cmake_dependent_option(SUYU_RECOMPILER_CLI "Compile the experimental suyu-recomp tool" OFF
+cmake_dependent_option(SUYU_RECOMPILER_CLI "Compile the suyu-recomp AOT tool" ON
                        "NOT ANDROID" OFF)
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR PLATFORM_LINUX" OFF)

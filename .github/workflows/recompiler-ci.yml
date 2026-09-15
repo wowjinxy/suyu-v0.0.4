@@ -106,7 +106,6 @@ jobs:
           -DENABLE_QT=OFF
           -DBUILD_TESTING=ON
           -DYUZU_TESTS=ON
-          -DSUYU_RECOMPILER_CLI=ON
           -DOPENSSL_ROOT_DIR=/usr
 
       - name: Build runtime and tests

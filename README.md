@@ -65,7 +65,7 @@ As derived from §512(f), if Nintendo (or an affiliated entity) knowingly materi
 
 ```bat
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
-cmake --build build --target suyu suyu-cmd
+cmake --build build --target suyu suyu-cmd suyu_recomp
 ```
 
 ### Linux
@@ -73,7 +73,7 @@ cmake --build build --target suyu suyu-cmd
 ```sh
 sudo apt-get install ninja-build qt6-base-dev libqt6svg6-dev libusb-1.0-0-dev libssl-dev
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
-cmake --build build --target suyu suyu-cmd
+cmake --build build --target suyu suyu-cmd suyu_recomp
 ```
 
 ### Android
