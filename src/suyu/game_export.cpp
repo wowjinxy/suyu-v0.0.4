@@ -367,15 +367,15 @@ void GameExportDialog::SetupUi() {
             &QWidget::setEnabled);
     steam_replace_rom_checkbox->setEnabled(false);
 
-    fallback_to_interpreter_checkbox = new QCheckBox(
-        tr("Fall back to interpreter if a module fails to recompile"), this);
-    fallback_to_interpreter_checkbox->setChecked(true);
-    fallback_to_interpreter_checkbox->setToolTip(
+    fallback_to_jit_checkbox = new QCheckBox(
+        tr("Fall back to Dynarmic JIT if a module fails to recompile"), this);
+    fallback_to_jit_checkbox->setChecked(true);
+    fallback_to_jit_checkbox->setToolTip(
         tr("When checked: if a module cannot be recompiled (e.g. too complex, "
            "unsupported instructions), the export continues and that module will "
-           "use the dynarmic JIT at runtime instead of the static recompiled code. "
+           "use the Dynarmic JIT at runtime instead of the static recompiled code. "
            "When unchecked: any recompile failure aborts the entire export."));
-    layout->addWidget(fallback_to_interpreter_checkbox);
+    layout->addWidget(fallback_to_jit_checkbox);
 
     // Source vs Build is a real, explicit choice rather than an easily-missed
     // checkbox, because the two produce completely different deliverables and
@@ -419,7 +419,7 @@ void GameExportDialog::SetupUi() {
              "exefs/ holds one C project per module (main, rtld, sdk, ...). "
              "Build has suyu compile it for you (slow on large titles). "
              "Source gives you the C + CMakeLists.txt to compile yourself. "
-             "With fallback enabled, modules that fail recompile use the dynarmic JIT at runtime."),
+             "With fallback enabled, modules that fail recompile use the Dynarmic JIT at runtime."),
         this);
     note_label->setWordWrap(true);
     note_label->setStyleSheet(QStringLiteral("color: #888;"));
@@ -709,7 +709,7 @@ static std::vector<u64> ScanDataForCodePointers(const NsoAnalysisResult& mod) {
 ///
 /// Missing them is what leaves a brand-new guest thread starting at an address
 /// no block covers, so every thread the game spawns drops straight to the
-/// interpreter. Seeding them here keeps that work in statically recompiled
+/// Dynarmic JIT. Seeding them here keeps that work in statically recompiled
 /// code. Over-inclusive on purpose: a value that merely looks like a text
 /// address only ever costs one extra block boundary, never a wrong block.
 static std::vector<u64> ScanRelocationsForCodePointers(const NsoAnalysisResult& mod) {
@@ -1605,8 +1605,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         }
     }
 
-    const bool fallback_enabled = fallback_to_interpreter_checkbox &&
-                                  fallback_to_interpreter_checkbox->isChecked();
+    const bool fallback_enabled =
+        fallback_to_jit_checkbox && fallback_to_jit_checkbox->isChecked();
 
     u64 recomp_total_blocks = 0;
     u64 recomp_instructions_visited = 0;
@@ -1658,8 +1658,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             if (!fallback_enabled) {
                 QMessageBox::critical(
                     this, tr("Export Failed"),
-                    tr("Module '%1' could not be recompiled.\n\nEnable 'Fall back to interpreter' "
-                       "to skip failed modules and use the dynarmic JIT for them at runtime.")
+                    tr("Module '%1' could not be recompiled.\n\nEnable 'Fall back to Dynarmic JIT' "
+                       "to skip failed modules and use the JIT for them at runtime.")
                         .arg(mod.name));
                 return {};
             }
@@ -1669,13 +1669,13 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 if (stub.open(QIODevice::WriteOnly | QIODevice::Text)) {
                     QTextStream o(&stub);
                     o << "# Module " << mod.name
-                      << " fell back to dynarmic JIT — no static recompilation available.\n"
-                         "# At runtime suyu will use the interpreter for this module.\n"
-                         "message(STATUS \"[fallback] " << mod.name << " uses dynarmic\")\n";
+                      << " fell back to Dynarmic JIT — no static recompilation available.\n"
+                         "# At runtime suyu will use the JIT for this module.\n"
+                         "message(STATUS \"[fallback] " << mod.name << " uses Dynarmic JIT\")\n";
                 }
             }
             fallback_modules.append(mod.name);
-            LOG_WARNING(Frontend, "Module {} fell back to dynarmic interpreter", mod.name.toStdString());
+            LOG_WARNING(Frontend, "Module {} fell back to Dynarmic JIT", mod.name.toStdString());
             continue;
         }
 
@@ -1721,7 +1721,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     LOG_ERROR(Frontend, "Recompiled module {} failed to compile:\n{}",
                               mod.name.toStdString(), build_log.right(4000).toStdString());
                     if (fallback_enabled) {
-                        LOG_WARNING(Frontend, "Module {} compile failed, falling back to dynarmic",
+                        LOG_WARNING(Frontend, "Module {} compile failed, falling back to Dynarmic",
                                     mod.name.toStdString());
                         fallback_modules.append(mod.name);
                         continue;
@@ -1729,7 +1729,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     QMessageBox::critical(
                         this, tr("Build Failed"),
                         tr("Compiling module '%1' failed.\n\nThe generated sources are still in:\n"
-                           "%2\n\nEnable 'Fall back to interpreter' to continue despite build "
+                           "%2\n\nEnable 'Fall back to Dynarmic JIT' to continue despite build "
                            "failures. See the suyu log for compiler output.")
                             .arg(mod.name, mod_dir));
                     return {};
@@ -1738,7 +1738,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 LOG_ERROR(Frontend, "cmake could not configure recompiled module {}:\n{}",
                           mod.name.toStdString(), configure_log.right(4000).toStdString());
                 if (fallback_enabled) {
-                    LOG_WARNING(Frontend, "Module {} cmake configure failed, falling back to dynarmic",
+                    LOG_WARNING(Frontend,
+                                "Module {} cmake configure failed, falling back to Dynarmic",
                                 mod.name.toStdString());
                     fallback_modules.append(mod.name);
                     continue;
@@ -1746,7 +1747,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 QMessageBox::critical(
                     this, tr("Build Failed"),
                     tr("CMake could not configure module '%1'.\n\nThe generated sources are in:\n"
-                       "%2\n\nEnable 'Fall back to interpreter' to continue despite failures.")
+                       "%2\n\nEnable 'Fall back to Dynarmic JIT' to continue despite failures.")
                         .arg(mod.name, mod_dir));
                 return {};
             }
@@ -1816,7 +1817,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                   << "endif()\n";
             }
             if (!fallback_modules.isEmpty()) {
-                o << "\n# Modules using dynarmic JIT fallback (not recompiled):\n";
+                o << "\n# Modules using Dynarmic JIT fallback (not recompiled):\n";
                 for (const auto& m : fallback_modules) {
                     o << "# " << m << "\n";
                 }
@@ -2517,24 +2518,22 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         QFile readme(pkg_dir + QDir::separator() + QStringLiteral("README_NATIVE_EXPORT.txt"));
         if (readme.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream out(&readme);
-            out << "Recompiled native build — fully standalone, no ROM or keys needed to run\n\n";
+            out << "Title-specialized AOT build — no original ROM or keys needed to run\n\n";
             out << "Run: double-click launch.bat (or " << game_name << ".exe directly)\n\n";
-            out << "This is the game itself, statically recompiled to x86 machine code and\n";
-            out << "linked into " << game_name << ".exe alongside suyu's HLE/GPU/audio backend\n";
-            out << "- no emulator install and no separate DLLs for the game code.\n\n";
+            out << "This package contains a title-specialized suyu runtime. Its verified AOT\n";
+            out << "blocks are linked into " << game_name << ".exe alongside suyu's HLE/GPU/audio\n";
+            out << "backend; no separate emulator installation or game-code DLLs are required.\n\n";
             out << "What runs native vs emulated:\n";
-            out << "- Native  : the game's own CPU code, translated ahead of time to C and\n";
-            out << "            compiled into this exe. No instruction decoding at run time.\n";
+            out << "- AOT     : discovered guest CPU blocks translated ahead of time to C and\n";
+            out << "            compiled into this exe run directly as host machine code.\n";
             out << "- Emulated: system calls, OS services (filesystem, input, audio, sockets)\n";
             out << "            and the GPU, all served by suyu's HLE backend built into the\n";
             out << "            same exe. A console game cannot run without these.\n";
-            out << "- Fallback: a small interpreter covers the few instructions the static\n";
-            out << "            recompiler cannot translate yet (mostly rare SIMD forms) and\n";
-            out << "            code only reachable through computed branches. It runs on\n";
-            out << "            demand and hands control straight back; correctness never\n";
-            out << "            depends on how much of the program it covers.\n\n";
+            out << "- Fallback: Dynarmic JIT handles unsupported instructions, uncovered\n";
+            out << "            indirect targets, and dynamic or invalidated code. It hands\n";
+            out << "            control back when execution reaches a covered AOT block.\n\n";
             out << "Contents:\n";
-            out << "- " << game_name << ".exe : the game (recompiled code + HLE/GPU backend, one file)\n";
+            out << "- " << game_name << ".exe : title-specialized runtime (AOT code + suyu backend)\n";
             out << "- launch.bat      : one-click launcher\n";
             out << "- exefs/          : the game's own executables and data, extracted once at\n";
             out << "                    export time so no ROM or decryption keys are needed to run\n";
@@ -2612,7 +2611,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
 }
 
 // ---------------------------------------------------------------------------
-// Locating already-built standalone recompiled executables
+// Locating already-built launchers and per-module AOT test executables
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -3049,12 +3048,13 @@ void GameExportDialog::OnExport() {
             this, tr("AOT Export Complete"),
             tr("Game exported as C source to:\n%1\n\n"
                "The package contains:\n"
-               "- Recompiled C source (buildable standalone PC executable)\n"
-               "- Runtime with save/load support (save_data/ directory next to exe)\n"
+               "- Recompiled C source (one project per guest module)\n"
+               "- A bundled suyu launcher with HLE/GPU/audio/input support\n"
                "- Bundled data segments (text, rodata, data)\n"
                "- Build scripts for Windows (.cmd) and Unix (.sh)\n\n"
-               "Run build_native_windows.cmd (or build_native_unix.sh) in aot_cache/exefs/ to compile.\n"
-               "The resulting executable runs independently — no emulator required.\n\n"
+               "Run build_native_windows.cmd (or build_native_unix.sh) in aot_cache/exefs/ to compile\n"
+               "the AOT modules, then start the packaged game launcher. Dynarmic remains the safe\n"
+               "fallback for code the static translator does not cover.\n\n"
                "(Choose \"Build\" instead of \"Source\" as the Export Format to have suyu compile "
                "this for you automatically.)")
                 .arg(final_path));
